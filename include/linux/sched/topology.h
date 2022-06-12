@@ -71,6 +71,7 @@ struct sched_domain_shared {
 	int		has_idle_cores;
 
 	bool            overutilized;
+	int		nr_idle_scan;
 };
 
 struct sched_domain {
