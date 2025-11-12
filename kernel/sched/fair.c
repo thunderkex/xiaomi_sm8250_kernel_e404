@@ -12569,7 +12569,7 @@ static int newidle_balance(struct rq *this_rq, struct rq_flags *rf)
 	t0 = sched_clock_cpu(this_cpu);
 	__update_blocked_averages(this_rq);
 
-        raw_spin_unlock(&this_rq->lock);
+	raw_spin_unlock(&this_rq->lock);
 
 	rcu_read_lock();
 	for_each_domain(this_cpu, sd) {
