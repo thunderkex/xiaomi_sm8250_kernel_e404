@@ -108,8 +108,8 @@ static void clean_bio_queue(int idx)
 
 	while (sizeof(struct write_work) == kfifo_out(&kcompress[idx].write_fifo,
 				&entry, sizeof(struct write_work))) {
-		bio_put(entry.bio);
 		entry.cb(entry.mem, entry.bio);
+		bio_put(entry.bio);
 	}
 	kfifo_free(&kcompress[idx].write_fifo);
 }
@@ -270,6 +270,8 @@ int schedule_bio_write(void *mem, struct bio *bio, compress_callback cb)
 					atomic_set(&kcompress[idx].running, KCOMPRESSD_NOT_STARTED);
 					pr_warn("Failed to start kcompressd:%d\n", idx);
 					clean_bio_queue(idx);
+					bio_put(bio);
+					return -EBUSY;
 				}
 				break;
 			case KCOMPRESSD_RUNNING:
