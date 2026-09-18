@@ -1,0 +1,10 @@
+# SPDX-License-Identifier: GPL-2.0-only
+config AX_DRAGONITE
+	bool "AxDragonite scene-boost kernel support"
+	default y
+	help
+	  Exposes /proc/ax_dragonite and /proc/ax_named_thread_affinity
+	  for the AxDragonite userspace performance engine.
+
+	  Say Y here to enable kernel-level thread pinning, priority
+	  boost interfaces, and named thread affinity management.
