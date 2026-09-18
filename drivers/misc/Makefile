@@ -84,3 +84,4 @@ obj-$(CONFIG_GPIO_TESTING_MODE)	+= gpio-testing-mode.o
 obj-$(CONFIG_PERF_HELPER)	+= perf_helper.o
 obj-$(CONFIG_E404_ATTRIBUTES)	+=	e404_attributes.o
 obj-$(CONFIG_NTSYNC)		+= ntsync.o
+obj-$(CONFIG_AX_DRAGONITE)	+= ax_dragonite/
