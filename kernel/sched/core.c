@@ -2566,6 +2566,10 @@ static void ttwu_do_wakeup(struct rq *rq, struct task_struct *p, int wake_flags,
 {
 	check_preempt_curr(rq, p, wake_flags);
 	p->state = TASK_RUNNING;
+#if IS_ENABLED(CONFIG_AX_DRAGONITE)
+	extern void ax_named_thread_affinity_apply(struct task_struct *p);
+	ax_named_thread_affinity_apply(p);
+#endif
 	trace_sched_wakeup(p);
 
 #ifdef CONFIG_SMP
