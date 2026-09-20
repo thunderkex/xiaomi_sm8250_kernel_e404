@@ -49,7 +49,7 @@ int ax_parse_cpumask(const char *buf, cpumask_t *mask);
 void ax_named_thread_affinity_apply(struct task_struct *p);
 
 /* Subsystem init/exit declarations */
-int ax_named_thread_affinity_init(struct proc_dir_entry *parent);
+int ax_named_thread_affinity_init(void);
 void ax_named_thread_affinity_exit(void);
 
 #endif /* _AX_DRAGONITE_H */
