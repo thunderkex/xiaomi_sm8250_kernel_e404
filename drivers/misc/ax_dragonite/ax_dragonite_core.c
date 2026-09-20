@@ -115,10 +115,11 @@ static ssize_t kswapd_pin_write(struct file *file, const char __user *ubuf,
 		}
 	}
 
-	/* 2. Pin any kswapd threads found in task list */
+	/* 2. Pin any kswapd and ksmd threads found in task list */
 	rcu_read_lock();
 	for_each_process_thread(g, t) {
-		if ((t->flags & PF_KSWAPD) || strncmp(t->comm, "kswapd", 6) == 0) {
+		if ((t->flags & PF_KSWAPD) || strncmp(t->comm, "kswapd", 6) == 0 ||
+		    strncmp(t->comm, "ksmd", 4) == 0) {
 			get_task_struct(t);
 			rcu_read_unlock();
 			set_cpus_allowed_ptr(t, &new_mask);
