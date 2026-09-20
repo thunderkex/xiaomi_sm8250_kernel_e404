@@ -16,7 +16,15 @@
 #include <linux/version.h>
 
 #define AX_MAX_AFFINITY_RULES 32
+#define AX_MAX_BOOST_ENTRIES 32
 #define AX_DRAGONITE_TAG "ax_dragonite: "
+
+struct ax_boost_entry {
+	pid_t pid;
+	int saved_nice;
+	int level;
+	bool active;
+};
 
 extern struct proc_dir_entry *ax_dragonite_dir;
 extern struct proc_dir_entry *ax_named_affinity_dir;
