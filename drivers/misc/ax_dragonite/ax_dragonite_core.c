@@ -23,6 +23,7 @@
 #include <linux/nodemask.h>
 #include <linux/mmzone.h>
 #include <linux/ratelimit.h>
+#include <linux/swap.h>
 
 #include "ax_dragonite.h"
 
@@ -303,6 +304,90 @@ static int boost_open(struct inode *inode, struct file *file)
 }
 
 /* -------------------------------------------------------------------------
+ * /proc/ax_dragonite/swappiness_override
+ * ------------------------------------------------------------------------- */
+static int saved_vm_swappiness;
+static unsigned int swappiness_lease_count;
+static bool swappiness_override_active;
+static DEFINE_SPINLOCK(swappiness_override_lock);
+
+static ssize_t swappiness_override_write(struct file *file, const char __user *ubuf,
+					 size_t count, loff_t *ppos)
+{
+	char kbuf[32];
+	int target_val;
+	unsigned long flags;
+	size_t len = min(count, sizeof(kbuf) - 1);
+
+	if (!ax_dragonite_is_authorized()) {
+		pr_warn_ratelimited(AX_DRAGONITE_TAG
+				    "unauthorized swappiness_override write from uid %u\n",
+				    from_kuid(&init_user_ns, current_euid()));
+		return -EPERM;
+	}
+
+	if (copy_from_user(kbuf, ubuf, len))
+		return -EFAULT;
+	kbuf[len] = '\0';
+
+	if (kstrtoint(strim(kbuf), 10, &target_val) < 0) {
+		pr_warn_ratelimited(AX_DRAGONITE_TAG "invalid swappiness value: %s\n", kbuf);
+		return -EINVAL;
+	}
+
+	spin_lock_irqsave(&swappiness_override_lock, flags);
+	if (target_val < 0) {
+		/* Release lease: decrement refcount; restore on final release */
+		if (swappiness_lease_count > 0) {
+			swappiness_lease_count--;
+			if (swappiness_lease_count == 0 && swappiness_override_active) {
+				vm_swappiness = saved_vm_swappiness;
+				swappiness_override_active = false;
+			}
+		}
+	} else if (target_val <= 200) {
+		/* Acquire lease: save original value on initial acquisition */
+		if (swappiness_lease_count == 0 && !swappiness_override_active) {
+			saved_vm_swappiness = vm_swappiness;
+			swappiness_override_active = true;
+		}
+		vm_swappiness = target_val;
+		swappiness_lease_count++;
+	} else {
+		spin_unlock_irqrestore(&swappiness_override_lock, flags);
+		pr_warn_ratelimited(AX_DRAGONITE_TAG "swappiness out of range (0-200): %d\n", target_val);
+		return -EINVAL;
+	}
+	spin_unlock_irqrestore(&swappiness_override_lock, flags);
+
+	return count;
+}
+
+static int swappiness_override_show(struct seq_file *m, void *v)
+{
+	unsigned long flags;
+	bool active;
+	int cur_swappiness, orig_swappiness;
+	unsigned int lease_cnt;
+
+	spin_lock_irqsave(&swappiness_override_lock, flags);
+	active = swappiness_override_active;
+	cur_swappiness = vm_swappiness;
+	orig_swappiness = saved_vm_swappiness;
+	lease_cnt = swappiness_lease_count;
+	spin_unlock_irqrestore(&swappiness_override_lock, flags);
+
+	seq_printf(m, "active: %d\ncurrent_swappiness: %d\nsaved_original: %d\nlease_count: %u\n",
+		   active ? 1 : 0, cur_swappiness, orig_swappiness, lease_cnt);
+	return 0;
+}
+
+static int swappiness_override_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, swappiness_override_show, NULL);
+}
+
+/* -------------------------------------------------------------------------
  * Procfs Ops definition (Linux 4.19 and 5.6+ compatible)
  * ------------------------------------------------------------------------- */
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 6, 0)
@@ -318,6 +403,14 @@ static const struct proc_ops boost_ops = {
 	.proc_open = boost_open,
 	.proc_read = seq_read,
 	.proc_write = boost_write,
+	.proc_lseek = seq_lseek,
+	.proc_release = single_release,
+};
+
+static const struct proc_ops swappiness_override_ops = {
+	.proc_open = swappiness_override_open,
+	.proc_read = seq_read,
+	.proc_write = swappiness_override_write,
 	.proc_lseek = seq_lseek,
 	.proc_release = single_release,
 };
@@ -339,6 +432,15 @@ static const struct file_operations boost_ops = {
 	.llseek = seq_lseek,
 	.release = single_release,
 };
+
+static const struct file_operations swappiness_override_ops = {
+	.owner = THIS_MODULE,
+	.open = swappiness_override_open,
+	.read = seq_read,
+	.write = swappiness_override_write,
+	.llseek = seq_lseek,
+	.release = single_release,
+};
 #endif
 
 /* -------------------------------------------------------------------------
@@ -356,6 +458,7 @@ static int __init ax_dragonite_core_init(void)
 
 	proc_create("kswapd_pin", 0640, ax_dragonite_dir, &kswapd_pin_ops);
 	proc_create("boost", 0640, ax_dragonite_dir, &boost_ops);
+	proc_create("swappiness_override", 0640, ax_dragonite_dir, &swappiness_override_ops);
 
 	ax_named_thread_affinity_init();
 
@@ -368,6 +471,7 @@ static void __exit ax_dragonite_core_exit(void)
 	ax_named_thread_affinity_exit();
 
 	if (ax_dragonite_dir) {
+		remove_proc_entry("swappiness_override", ax_dragonite_dir);
 		remove_proc_entry("boost", ax_dragonite_dir);
 		remove_proc_entry("kswapd_pin", ax_dragonite_dir);
 		remove_proc_entry("ax_dragonite", NULL);
