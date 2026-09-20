@@ -59,7 +59,7 @@ static void apply_named_affinity_to_tasks(const char *comm, const cpumask_t *mas
 	rcu_read_unlock();
 }
 
-/* Fast opportunistic hook called from wake_up_new_task() */
+/* Named affinity hook called from wake_up_new_task() post-unlock and PR_SET_NAME */
 void ax_named_thread_affinity_apply(struct task_struct *p)
 {
 	int i;

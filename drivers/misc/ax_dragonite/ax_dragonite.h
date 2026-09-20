@@ -37,7 +37,7 @@ static inline bool ax_dragonite_is_authorized(void)
 /* CPUMask parser supporting hex ("0f", "0x0f") and cpulist ("0-3", "0,1,2") */
 int ax_parse_cpumask(const char *buf, cpumask_t *mask);
 
-/* Named affinity hook for task fork / wake */
+/* Named affinity hook for task fork (wake_up_new_task) and thread rename (PR_SET_NAME) */
 void ax_named_thread_affinity_apply(struct task_struct *p);
 
 /* Subsystem init/exit declarations */
