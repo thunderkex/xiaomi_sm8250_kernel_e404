@@ -151,8 +151,10 @@ static ssize_t rules_write(struct file *file, const char __user *ubuf,
 	}
 	mutex_unlock(&affinity_mutex);
 
-	if (target_slot == -1)
+	if (target_slot == -1) {
 		pr_warn_ratelimited(AX_DRAGONITE_TAG "affinity rules table full\n");
+		return -ENOSPC;
+	}
 
 	/* Apply immediately to running threads matching this comm */
 	apply_named_affinity_to_tasks(comm_str, &mask);
@@ -262,7 +264,11 @@ static const struct file_operations enabled_ops = {
 /* -------------------------------------------------------------------------
  * Init / Exit
  * ------------------------------------------------------------------------- */
-int ax_named_thread_affinity_init(struct proc_dir_entry *parent)
+/*
+ * Named thread affinity is intentionally kept at /proc root to preserve compatibility
+ * with Android userspace paths (/proc/ax_named_thread_affinity/{rules,enabled}).
+ */
+int ax_named_thread_affinity_init(void)
 {
 	ax_named_affinity_dir = proc_mkdir("ax_named_thread_affinity", NULL);
 	if (!ax_named_affinity_dir) {
@@ -270,11 +276,11 @@ int ax_named_thread_affinity_init(struct proc_dir_entry *parent)
 		return -ENOMEM;
 	}
 
-	proc_create("rules", 0664, ax_named_affinity_dir, &rules_ops);
-	proc_create("enabled", 0664, ax_named_affinity_dir, &enabled_ops);
+	proc_create("rules", 0640, ax_named_affinity_dir, &rules_ops);
+	proc_create("enabled", 0640, ax_named_affinity_dir, &enabled_ops);
 
 	/* Compatibility node at /proc/ax_named_thread_affinity_rules */
-	proc_create("ax_named_thread_affinity_rules", 0664, NULL, &rules_ops);
+	proc_create("ax_named_thread_affinity_rules", 0640, NULL, &rules_ops);
 
 	return 0;
 }

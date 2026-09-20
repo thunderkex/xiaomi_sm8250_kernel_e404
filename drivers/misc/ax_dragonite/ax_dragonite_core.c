@@ -353,10 +353,10 @@ static int __init ax_dragonite_core_init(void)
 		return -ENOMEM;
 	}
 
-	proc_create("kswapd_pin", 0664, ax_dragonite_dir, &kswapd_pin_ops);
-	proc_create("boost", 0664, ax_dragonite_dir, &boost_ops);
+	proc_create("kswapd_pin", 0640, ax_dragonite_dir, &kswapd_pin_ops);
+	proc_create("boost", 0640, ax_dragonite_dir, &boost_ops);
 
-	ax_named_thread_affinity_init(ax_dragonite_dir);
+	ax_named_thread_affinity_init();
 
 	pr_info(AX_DRAGONITE_TAG "driver initialized successfully\n");
 	return 0;
