@@ -72,11 +72,15 @@ void ax_named_thread_affinity_apply(struct task_struct *p)
 
 	rcu_read_lock();
 	for (i = 0; i < AX_MAX_AFFINITY_RULES; i++) {
-		if (READ_ONCE(affinity_rules[i].active) &&
+		if (smp_load_acquire(&affinity_rules[i].active) &&
 		    strncmp(p->comm, affinity_rules[i].comm, TASK_COMM_LEN) == 0) {
 			cpumask_t mask;
 
 			cpumask_copy(&mask, &affinity_rules[i].mask);
+			if (cpumask_empty(&mask)) {
+				rcu_read_unlock();
+				return;
+			}
 			affinity_rules[i].applied_count++;
 			rcu_read_unlock();
 			set_cpus_allowed_ptr(p, &mask);
