@@ -17,10 +17,6 @@
 #include <linux/sched.h>
 #include <linux/cpu_cooling.h>
 
-#ifdef CONFIG_E404_ATTRIBUTES
-#include <linux/e404_attributes.h>
-#endif
-
 #define CREATE_TRACE_POINTS
 #include <trace/events/dcvsh.h>
 
@@ -88,6 +84,7 @@ struct cpufreq_qcom {
 	char dcvsh_irq_name[MAX_FN_SIZE];
 	bool is_irq_enabled;
 	bool is_irq_requested;
+	bool exited;
 };
 
 struct cpufreq_counter {
@@ -187,13 +184,16 @@ static void limits_dcvsh_poll(struct work_struct *work)
 
 	mutex_lock(&c->dcvsh_lock);
 
+	if (c->exited)
+		goto out;
+
 	cpu = cpumask_first(&c->related_cpus);
 
 	freq_limit = limits_mitigation_notify(c, true);
 
 	dcvsh_freq = qcom_cpufreq_hw_get(cpu);
 
-	if (freq_limit != dcvsh_freq) {
+	if (freq_limit < dcvsh_freq) {
 		mod_delayed_work(system_highpri_wq, &c->freq_poll_work,
 				msecs_to_jiffies(LIMITS_POLLING_DELAY_MS));
 	} else {
@@ -208,6 +208,7 @@ static void limits_dcvsh_poll(struct work_struct *work)
 		enable_irq(c->dcvsh_irq);
 	}
 
+out:
 	mutex_unlock(&c->dcvsh_lock);
 }
 
@@ -424,6 +425,12 @@ static void qcom_cpufreq_ready(struct cpufreq_policy *policy)
 	struct device_node *np;
 	unsigned int cpu = policy->cpu;
 
+	struct cpufreq_qcom *c = qcom_freq_domain_map[cpu];
+
+	mutex_lock(&c->dcvsh_lock);
+	c->exited = true;
+	mutex_unlock(&c->dcvsh_lock);
+
 	if (cdev[cpu])
 		return;
 
@@ -495,9 +502,9 @@ static int qcom_cpufreq_hw_read_lut(struct platform_device *pdev,
 	u32 data, src, lval, i, core_count, prev_cc, prev_freq, cur_freq, volt;
 	u32 vc;
 	unsigned long cpu;
-	int ret, of_len, max_index = 0;
+	int ret, of_len, max_index;
 	u32 *of_table = NULL;
-	char tbl_name[32];
+	char tbl_name[] = "qcom,cpufreq-table-##";
 	bool invalidate_freq;
 
 	c->table = devm_kcalloc(dev, lut_max_entries + 1,
@@ -505,22 +512,8 @@ static int qcom_cpufreq_hw_read_lut(struct platform_device *pdev,
 	if (!c->table)
 		return -ENOMEM;
 
-#ifdef CONFIG_E404_ATTRIBUTES
-	if (e404_data.effcpu == 1) {
-		snprintf(tbl_name, sizeof(tbl_name), "qcom,effcpufreq-table-%d", domain_index);
-		pr_alert("E404: Using effcpu CPUFreq from DTB");
-		if (!of_find_property(dev->of_node, tbl_name, NULL)) {
-			snprintf(tbl_name, sizeof(tbl_name), "qcom,cpufreq-table-%d", domain_index);
-			pr_alert("E404: effcpu table not found, falling back to normal CPUFreq");
-		}
-	} else {
-		snprintf(tbl_name, sizeof(tbl_name), "qcom,cpufreq-table-%d", domain_index);
-		pr_alert("E404: Using normal CPUFreq from DTB");
-	}
-#else
-	snprintf(tbl_name, sizeof(tbl_name), "qcom,cpufreq-table-%d", domain_index);
-	pr_alert("E404: Using default CPUFreq from DTB");
-#endif
+	snprintf(tbl_name, sizeof(tbl_name), "qcom,cpufreq-table-%d",
+		 domain_index);
 
 	if (of_find_property(dev->of_node, tbl_name, &of_len) && of_len > 0) {
 		of_len /= sizeof(*of_table);
