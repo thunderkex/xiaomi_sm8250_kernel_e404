@@ -388,6 +388,20 @@ static int swappiness_override_open(struct inode *inode, struct file *file)
 }
 
 /* -------------------------------------------------------------------------
+ * /proc/ax_dragonite/version
+ * ------------------------------------------------------------------------- */
+static int version_show(struct seq_file *m, void *v)
+{
+	seq_printf(m, "AxDragonite 4.19.404R-dragonite\n");
+	return 0;
+}
+
+static int version_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, version_show, NULL);
+}
+
+/* -------------------------------------------------------------------------
  * Procfs Ops definition (Linux 4.19 and 5.6+ compatible)
  * ------------------------------------------------------------------------- */
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 6, 0)
@@ -411,6 +425,13 @@ static const struct proc_ops swappiness_override_ops = {
 	.proc_open = swappiness_override_open,
 	.proc_read = seq_read,
 	.proc_write = swappiness_override_write,
+	.proc_lseek = seq_lseek,
+	.proc_release = single_release,
+};
+
+static const struct proc_ops version_ops = {
+	.proc_open = version_open,
+	.proc_read = seq_read,
 	.proc_lseek = seq_lseek,
 	.proc_release = single_release,
 };
@@ -441,6 +462,14 @@ static const struct file_operations swappiness_override_ops = {
 	.llseek = seq_lseek,
 	.release = single_release,
 };
+
+static const struct file_operations version_ops = {
+	.owner = THIS_MODULE,
+	.open = version_open,
+	.read = seq_read,
+	.llseek = seq_lseek,
+	.release = single_release,
+};
 #endif
 
 /* -------------------------------------------------------------------------
@@ -459,6 +488,7 @@ static int __init ax_dragonite_core_init(void)
 	proc_create("kswapd_pin", 0640, ax_dragonite_dir, &kswapd_pin_ops);
 	proc_create("boost", 0640, ax_dragonite_dir, &boost_ops);
 	proc_create("swappiness_override", 0640, ax_dragonite_dir, &swappiness_override_ops);
+	proc_create("version", 0444, ax_dragonite_dir, &version_ops);
 
 	ax_named_thread_affinity_init();
 
@@ -471,6 +501,7 @@ static void __exit ax_dragonite_core_exit(void)
 	ax_named_thread_affinity_exit();
 
 	if (ax_dragonite_dir) {
+		remove_proc_entry("version", ax_dragonite_dir);
 		remove_proc_entry("swappiness_override", ax_dragonite_dir);
 		remove_proc_entry("boost", ax_dragonite_dir);
 		remove_proc_entry("kswapd_pin", ax_dragonite_dir);
