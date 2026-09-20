@@ -3,7 +3,7 @@ VERSION = 4
 PATCHLEVEL = 19
 SUBLEVEL = 404
 EXTRAVERSION = R
-NAME = "People's Front"
+NAME = Dragonite
 
 # *DOCUMENTATION*
 # To see a list of typical targets execute "make help"
