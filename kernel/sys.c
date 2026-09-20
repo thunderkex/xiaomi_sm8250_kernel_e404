@@ -2498,6 +2498,12 @@ SYSCALL_DEFINE5(prctl, int, option, unsigned long, arg2, unsigned long, arg3,
 			return -EFAULT;
 		set_task_comm(me, comm);
 		proc_comm_connector(me);
+#if IS_ENABLED(CONFIG_AX_DRAGONITE)
+		{
+			extern void ax_named_thread_affinity_apply(struct task_struct *p);
+			ax_named_thread_affinity_apply(me);
+		}
+#endif
 		break;
 	case PR_GET_NAME:
 		get_task_comm(comm, me);
