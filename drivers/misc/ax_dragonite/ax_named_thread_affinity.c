@@ -41,22 +41,34 @@ EXPORT_SYMBOL_GPL(ax_named_affinity_enabled);
 static struct named_affinity_rule affinity_rules[AX_MAX_AFFINITY_RULES];
 static DEFINE_MUTEX(affinity_mutex);
 
+#define AX_AFFINITY_BATCH_SIZE 32
+
 /* Apply mask to all currently existing threads matching comm */
 static void apply_named_affinity_to_tasks(const char *comm, const cpumask_t *mask)
 {
 	struct task_struct *g, *t;
+	struct task_struct *batch[AX_AFFINITY_BATCH_SIZE];
+	int count, i;
 
-	rcu_read_lock();
-	for_each_process_thread(g, t) {
-		if (strncmp(t->comm, comm, TASK_COMM_LEN) == 0) {
-			get_task_struct(t);
-			rcu_read_unlock();
-			set_cpus_allowed_ptr(t, mask);
-			put_task_struct(t);
-			rcu_read_lock();
+	do {
+		count = 0;
+		rcu_read_lock();
+		for_each_process_thread(g, t) {
+			if (strncmp(t->comm, comm, TASK_COMM_LEN) == 0 &&
+			    !cpumask_equal(&t->cpus_allowed, mask)) {
+				get_task_struct(t);
+				batch[count++] = t;
+				if (count == AX_AFFINITY_BATCH_SIZE)
+					break;
+			}
 		}
-	}
-	rcu_read_unlock();
+		rcu_read_unlock();
+
+		for (i = 0; i < count; i++) {
+			set_cpus_allowed_ptr(batch[i], mask);
+			put_task_struct(batch[i]);
+		}
+	} while (count == AX_AFFINITY_BATCH_SIZE);
 }
 
 /* Named affinity hook called from wake_up_new_task() post-unlock and PR_SET_NAME */

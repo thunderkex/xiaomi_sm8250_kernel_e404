@@ -116,19 +116,31 @@ static ssize_t kswapd_pin_write(struct file *file, const char __user *ubuf,
 		}
 	}
 
+#define AX_PIN_MAX_TASKS 16
+
 	/* 2. Pin any kswapd and ksmd threads found in task list */
-	rcu_read_lock();
-	for_each_process_thread(g, t) {
-		if ((t->flags & PF_KSWAPD) || strncmp(t->comm, "kswapd", 6) == 0 ||
-		    strncmp(t->comm, "ksmd", 4) == 0) {
-			get_task_struct(t);
-			rcu_read_unlock();
-			set_cpus_allowed_ptr(t, &new_mask);
-			put_task_struct(t);
-			rcu_read_lock();
+	{
+		struct task_struct *found[AX_PIN_MAX_TASKS];
+		int i, n = 0;
+
+		rcu_read_lock();
+		for_each_process_thread(g, t) {
+			if ((t->flags & PF_KSWAPD) ||
+			    strncmp(t->comm, "kswapd", 6) == 0 ||
+			    strncmp(t->comm, "ksmd", 4) == 0) {
+				if (n < AX_PIN_MAX_TASKS) {
+					get_task_struct(t);
+					found[n++] = t;
+				}
+			}
+		}
+		rcu_read_unlock();
+
+		for (i = 0; i < n; i++) {
+			set_cpus_allowed_ptr(found[i], &new_mask);
+			put_task_struct(found[i]);
 		}
 	}
-	rcu_read_unlock();
 
 	return count;
 }
