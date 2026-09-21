@@ -24,6 +24,7 @@
 #include <linux/mmzone.h>
 #include <linux/ratelimit.h>
 #include <linux/swap.h>
+#include <linux/cpuhotplug.h>
 
 #include "ax_dragonite.h"
 
@@ -32,6 +33,30 @@ EXPORT_SYMBOL_GPL(ax_dragonite_dir);
 
 static cpumask_t kswapd_pinned_mask;
 static DEFINE_SPINLOCK(kswapd_pin_lock);
+static enum cpuhp_state ax_kswapd_hp_state;
+
+static int ax_kswapd_cpu_online(unsigned int cpu)
+{
+	unsigned long flags;
+	cpumask_t mask;
+	int nid;
+
+	spin_lock_irqsave(&kswapd_pin_lock, flags);
+	cpumask_copy(&mask, &kswapd_pinned_mask);
+	spin_unlock_irqrestore(&kswapd_pin_lock, flags);
+
+	if (cpumask_empty(&mask))
+		return 0;
+
+	for_each_online_node(nid) {
+		struct pglist_data *pgdat = NODE_DATA(nid);
+
+		if (pgdat && pgdat->kswapd)
+			set_cpus_allowed_ptr(pgdat->kswapd, &mask);
+	}
+
+	return 0;
+}
 
 static struct ax_boost_entry boost_table[AX_MAX_BOOST_ENTRIES];
 static unsigned long total_boost_count;
@@ -489,6 +514,8 @@ static const struct file_operations version_ops = {
  * ------------------------------------------------------------------------- */
 static int __init ax_dragonite_core_init(void)
 {
+	int ret;
+
 	cpumask_clear(&kswapd_pinned_mask);
 
 	ax_dragonite_dir = proc_mkdir("ax_dragonite", NULL);
@@ -504,12 +531,21 @@ static int __init ax_dragonite_core_init(void)
 
 	ax_named_thread_affinity_init();
 
+	ret = cpuhp_setup_state_nocalls(CPUHP_AP_ONLINE_DYN,
+					"ax_dragonite/kswapd:online",
+					ax_kswapd_cpu_online, NULL);
+	if (ret > 0)
+		ax_kswapd_hp_state = ret;
+
 	pr_info(AX_DRAGONITE_TAG "driver initialized successfully\n");
 	return 0;
 }
 
 static void __exit ax_dragonite_core_exit(void)
 {
+	if (ax_kswapd_hp_state)
+		cpuhp_remove_state_nocalls(ax_kswapd_hp_state);
+
 	ax_named_thread_affinity_exit();
 
 	if (ax_dragonite_dir) {
