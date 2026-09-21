@@ -27,6 +27,7 @@
 #include <linux/cpuhotplug.h>
 #include <linux/jiffies.h>
 #include <linux/workqueue.h>
+#include <linux/utsname.h>
 
 #include "ax_dragonite.h"
 
@@ -507,7 +508,7 @@ static int swappiness_override_open(struct inode *inode, struct file *file)
  * ------------------------------------------------------------------------- */
 static int version_show(struct seq_file *m, void *v)
 {
-	seq_printf(m, "AxDragonite 4.19.404R-dragonite\n");
+	seq_printf(m, "AxDragonite %s\n", init_utsname()->release);
 	return 0;
 }
 
