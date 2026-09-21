@@ -25,6 +25,8 @@
 #include <linux/ratelimit.h>
 #include <linux/swap.h>
 #include <linux/cpuhotplug.h>
+#include <linux/jiffies.h>
+#include <linux/workqueue.h>
 
 #include "ax_dragonite.h"
 
@@ -389,17 +391,40 @@ static int boost_open(struct inode *inode, struct file *file)
 /* -------------------------------------------------------------------------
  * /proc/ax_dragonite/swappiness_override
  * ------------------------------------------------------------------------- */
+#define AX_SWAPPINESS_LEASE_TTL_MS 15000
+
 static int saved_vm_swappiness;
+static int applied_vm_swappiness;
 static unsigned int swappiness_lease_count;
 static bool swappiness_override_active;
+static unsigned long swappiness_expires;
 static DEFINE_SPINLOCK(swappiness_override_lock);
+
+static void ax_swappiness_reap_fn(struct work_struct *work);
+static DECLARE_DELAYED_WORK(ax_swappiness_work, ax_swappiness_reap_fn);
+
+static void ax_swappiness_reap_fn(struct work_struct *work)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&swappiness_override_lock, flags);
+	if (swappiness_override_active &&
+	    time_after_eq(jiffies, swappiness_expires)) {
+		/* Only restore if userspace sysctl has not overwritten it */
+		if (vm_swappiness == applied_vm_swappiness)
+			vm_swappiness = saved_vm_swappiness;
+		swappiness_override_active = false;
+		swappiness_lease_count = 0;
+	}
+	spin_unlock_irqrestore(&swappiness_override_lock, flags);
+}
 
 static ssize_t swappiness_override_write(struct file *file, const char __user *ubuf,
 					 size_t count, loff_t *ppos)
 {
 	char kbuf[32];
 	int target_val;
-	unsigned long flags;
+	unsigned long flags, ttl;
 	size_t len = min(count, sizeof(kbuf) - 1);
 
 	if (!ax_dragonite_is_authorized()) {
@@ -424,8 +449,10 @@ static ssize_t swappiness_override_write(struct file *file, const char __user *u
 		if (swappiness_lease_count > 0) {
 			swappiness_lease_count--;
 			if (swappiness_lease_count == 0 && swappiness_override_active) {
-				vm_swappiness = saved_vm_swappiness;
+				if (vm_swappiness == applied_vm_swappiness)
+					vm_swappiness = saved_vm_swappiness;
 				swappiness_override_active = false;
+				cancel_delayed_work(&ax_swappiness_work);
 			}
 		}
 	} else if (target_val <= 200) {
@@ -434,11 +461,16 @@ static ssize_t swappiness_override_write(struct file *file, const char __user *u
 			saved_vm_swappiness = vm_swappiness;
 			swappiness_override_active = true;
 		}
+		applied_vm_swappiness = target_val;
 		vm_swappiness = target_val;
 		swappiness_lease_count++;
+		ttl = msecs_to_jiffies(AX_SWAPPINESS_LEASE_TTL_MS);
+		swappiness_expires = jiffies + ttl;
+		mod_delayed_work(system_wq, &ax_swappiness_work, ttl);
 	} else {
 		spin_unlock_irqrestore(&swappiness_override_lock, flags);
-		pr_warn_ratelimited(AX_DRAGONITE_TAG "swappiness out of range (0-200): %d\n", target_val);
+		pr_warn_ratelimited(AX_DRAGONITE_TAG "swappiness out of range (0-200): %d\n",
+				    target_val);
 		return -EINVAL;
 	}
 	spin_unlock_irqrestore(&swappiness_override_lock, flags);
@@ -605,6 +637,8 @@ static void __exit ax_dragonite_core_exit(void)
 		}
 	}
 	mutex_unlock(&boost_table_mutex);
+
+	cancel_delayed_work_sync(&ax_swappiness_work);
 
 	if (ax_dragonite_dir) {
 		remove_proc_entry("version", ax_dragonite_dir);
