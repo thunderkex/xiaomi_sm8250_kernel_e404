@@ -12,6 +12,7 @@
 #include <linux/kcov.h>
 #include <linux/delay.h>
 #include <linux/scs.h>
+#include <linux/ax_dragonite.h>
 
 #include <asm/switch_to.h>
 #include <asm/tlb.h>
@@ -3511,12 +3512,7 @@ void wake_up_new_task(struct task_struct *p)
 	}
 #endif
 	task_rq_unlock(rq, p, &rf);
-#if IS_ENABLED(CONFIG_AX_DRAGONITE)
-	{
-		extern void ax_named_thread_affinity_apply(struct task_struct *p);
-		ax_named_thread_affinity_apply(p);
-	}
-#endif
+	ax_named_thread_affinity_apply(p);
 }
 
 #ifdef CONFIG_PREEMPT_NOTIFIERS
