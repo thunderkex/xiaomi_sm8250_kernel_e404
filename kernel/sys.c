@@ -43,6 +43,7 @@
 #include <linux/version.h>
 #include <linux/ctype.h>
 #include <linux/mm.h>
+#include <linux/ax_dragonite.h>
 #include <linux/mempolicy.h>
 
 #include <linux/compat.h>
@@ -2498,12 +2499,7 @@ SYSCALL_DEFINE5(prctl, int, option, unsigned long, arg2, unsigned long, arg3,
 			return -EFAULT;
 		set_task_comm(me, comm);
 		proc_comm_connector(me);
-#if IS_ENABLED(CONFIG_AX_DRAGONITE)
-		{
-			extern void ax_named_thread_affinity_apply(struct task_struct *p);
-			ax_named_thread_affinity_apply(me);
-		}
-#endif
+		ax_named_thread_affinity_apply(me);
 		break;
 	case PR_GET_NAME:
 		get_task_comm(comm, me);
