@@ -53,6 +53,9 @@ enum {
 static unsigned int lut_row_size = LUT_ROW_SIZE;
 static unsigned int lut_max_entries = LUT_MAX_ENTRIES;
 static bool accumulative_counter;
+static unsigned int prime_max_freq_khz;
+module_param(prime_max_freq_khz, uint, 0644);
+MODULE_PARM_DESC(prime_max_freq_khz, "Cap maximum frequency for prime core in kHz (0 for unconstrained)");
 
 struct skipped_freq {
 	bool skip;
@@ -307,6 +310,11 @@ qcom_cpufreq_hw_target_index(struct cpufreq_policy *policy,
 {
 	struct cpufreq_qcom *c = policy->driver_data;
 	unsigned long flags;
+
+	if (prime_max_freq_khz && cpumask_test_cpu(7, &c->related_cpus)) {
+		while (index > 0 && policy->freq_table[index].frequency > prime_max_freq_khz)
+			index--;
+	}
 
 	if (c->skip_data.skip && index == c->skip_data.high_temp_index) {
 		spin_lock_irqsave(&c->skip_data.lock, flags);
