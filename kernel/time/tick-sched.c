@@ -412,7 +412,7 @@ void __init tick_nohz_full_setup(cpumask_var_t cpumask)
 	tick_nohz_full_running = true;
 }
 
-bool tick_nohz_cpu_hotpluggable(unsigned int cpu)
+static int tick_nohz_cpu_down(unsigned int cpu)
 {
 	/*
 	 * The boot CPU handles housekeeping duty (unbound timers,
@@ -420,13 +420,8 @@ bool tick_nohz_cpu_hotpluggable(unsigned int cpu)
 	 * CPUs. It must remain online when nohz full is enabled.
 	 */
 	if (tick_nohz_full_running && tick_do_timer_cpu == cpu)
-		return false;
-	return true;
-}
-
-static int tick_nohz_cpu_down(unsigned int cpu)
-{
-	return tick_nohz_cpu_hotpluggable(cpu) ? 0 : -EBUSY;
+		return -EBUSY;
+	return 0;
 }
 
 void __init tick_nohz_init(void)

@@ -32,14 +32,11 @@ typedef struct ipmi_smi *ipmi_smi_t;
 
 /*
  * Flags for set_check_watch() below.  Tells if the SMI should be
- * waiting for watchdog timeouts, commands and/or messages.  There is
- * also an internal flag for the message handler, SMIs should ignore
- * it.
+ * waiting for watchdog timeouts, commands and/or messages.
  */
-#define IPMI_WATCH_MASK_INTERNAL	(1 << 0)
-#define IPMI_WATCH_MASK_CHECK_MESSAGES	(1 << 1)
-#define IPMI_WATCH_MASK_CHECK_WATCHDOG	(1 << 2)
-#define IPMI_WATCH_MASK_CHECK_COMMANDS	(1 << 3)
+#define IPMI_WATCH_MASK_CHECK_MESSAGES	(1 << 0)
+#define IPMI_WATCH_MASK_CHECK_WATCHDOG	(1 << 1)
+#define IPMI_WATCH_MASK_CHECK_COMMANDS	(1 << 2)
 
 /*
  * Messages to/from the lower layer.  The smi interface will take one
@@ -65,12 +62,6 @@ struct ipmi_smi_msg {
 
 	int           rsp_size;
 	unsigned char rsp[IPMI_MAX_MSG_LENGTH];
-
-	/*
-	 * There should be a response message coming back in the BMC
-	 * message queue.
-	 */
-	bool needs_response;
 
 	/*
 	 * Will be called when the system is done with the message
@@ -124,15 +115,12 @@ struct ipmi_smi_handlers {
 
 	/*
 	 * Called by the upper layer when some user requires that the
-	 * interface watch for received messages and watchdog
-	 * pretimeouts (basically do a "Get Flags", or not.  Used by
-	 * the SMI to know if it should watch for these.  This may be
-	 * NULL if the SMI does not implement it.  watch_mask is from
-	 * IPMI_WATCH_MASK_xxx above.  The interface should run slower
-	 * timeouts for just watchdog checking or faster timeouts when
-	 * waiting for the message queue.
+	 * interface watch for events, received messages, watchdog
+	 * pretimeouts, or not.  Used by the SMI to know if it should
+	 * watch for these.  This may be NULL if the SMI does not
+	 * implement it.
 	 */
-	void (*set_need_watch)(void *send_info, unsigned int watch_mask);
+	void (*set_need_watch)(void *send_info, bool enable);
 
 	/*
 	 * Called when flushing all pending messages.

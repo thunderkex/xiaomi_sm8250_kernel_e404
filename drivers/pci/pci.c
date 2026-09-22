@@ -2517,17 +2517,15 @@ static const struct dmi_system_id bridge_d3_blacklist[] = {
 			DMI_MATCH(DMI_BOARD_VENDOR, "Gigabyte Technology Co., Ltd."),
 			DMI_MATCH(DMI_BOARD_NAME, "X299 DESIGNARE EX-CF"),
 		},
-	},
-	{
 		/*
 		 * Downstream device is not accessible after putting a root port
-		 * into D3cold and back into D0 on Elo i2.
+		 * into D3cold and back into D0 on Elo Continental Z2 board
 		 */
-		.ident = "Elo i2",
+		.ident = "Elo Continental Z2",
 		.matches = {
-			DMI_MATCH(DMI_SYS_VENDOR, "Elo Touch Solutions"),
-			DMI_MATCH(DMI_PRODUCT_NAME, "Elo i2"),
-			DMI_MATCH(DMI_PRODUCT_VERSION, "RevB"),
+			DMI_MATCH(DMI_BOARD_VENDOR, "Elo Touch Solutions"),
+			DMI_MATCH(DMI_BOARD_NAME, "Geminilake"),
+			DMI_MATCH(DMI_BOARD_VERSION, "Continental Z2"),
 		},
 	},
 #endif
@@ -4670,18 +4668,18 @@ static int pci_dev_reset_slot_function(struct pci_dev *dev, int probe)
 
 static void pci_dev_lock(struct pci_dev *dev)
 {
+	pci_cfg_access_lock(dev);
 	/* block PM suspend, driver probe, etc. */
 	device_lock(&dev->dev);
-	pci_cfg_access_lock(dev);
 }
 
 /* Return 1 on successful lock, 0 on contention */
 static int pci_dev_trylock(struct pci_dev *dev)
 {
-	if (device_trylock(&dev->dev)) {
-		if (pci_cfg_access_trylock(dev))
+	if (pci_cfg_access_trylock(dev)) {
+		if (device_trylock(&dev->dev))
 			return 1;
-		device_unlock(&dev->dev);
+		pci_cfg_access_unlock(dev);
 	}
 
 	return 0;
@@ -4689,8 +4687,8 @@ static int pci_dev_trylock(struct pci_dev *dev)
 
 static void pci_dev_unlock(struct pci_dev *dev)
 {
-	pci_cfg_access_unlock(dev);
 	device_unlock(&dev->dev);
+	pci_cfg_access_unlock(dev);
 }
 
 static void pci_dev_save_and_disable(struct pci_dev *dev)
@@ -5576,7 +5574,9 @@ enum pci_bus_speed pcie_get_speed_cap(struct pci_dev *dev)
 	 */
 	pcie_capability_read_dword(dev, PCI_EXP_LNKCAP2, &lnkcap2);
 	if (lnkcap2) { /* PCIe r3.0-compliant */
-		if (lnkcap2 & PCI_EXP_LNKCAP2_SLS_16_0GB)
+		if (lnkcap2 & PCI_EXP_LNKCAP2_SLS_32_0GB)
+			return PCIE_SPEED_32_0GT;
+		else if (lnkcap2 & PCI_EXP_LNKCAP2_SLS_16_0GB)
 			return PCIE_SPEED_16_0GT;
 		else if (lnkcap2 & PCI_EXP_LNKCAP2_SLS_8_0GB)
 			return PCIE_SPEED_8_0GT;
@@ -5816,8 +5816,6 @@ bool pci_device_is_present(struct pci_dev *pdev)
 {
 	u32 v;
 
-	/* Check PF if pdev is a VF, since VF Vendor/Device IDs are 0xffff */
-	pdev = pci_physfn(pdev);
 	if (pci_dev_is_disconnected(pdev))
 		return false;
 	return pci_bus_read_dev_vendor_id(pdev->bus, pdev->devfn, &v, 0);

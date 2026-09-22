@@ -1681,7 +1681,8 @@ static s32 cake_enqueue(struct sk_buff *skb, struct Qdisc *sch,
 {
 	u32 idx, tin, prev_qlen, prev_backlog, drop_id;
 	struct cake_sched_data *q = qdisc_priv(sch);
-	int len = qdisc_pkt_len(skb), ret;
+	int len = qdisc_pkt_len(skb);
+	int ret;
 	struct sk_buff *ack = NULL;
 	ktime_t now = ktime_get();
 	struct cake_tin_data *b;

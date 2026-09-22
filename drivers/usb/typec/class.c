@@ -195,7 +195,6 @@ static void typec_altmode_put_partner(struct altmode *altmode)
 		return;
 
 	adev = &altmode->adev;
-	partner_adev = &partner->adev;
 
 	if (is_typec_plug(adev->dev.parent)) {
 		struct typec_plug *plug = to_typec_plug(adev->dev.parent);

@@ -1349,15 +1349,7 @@ parse_ntb:
 	     "Parsed NTB with %d frames\n", dgram_counter);
 
 	to_process -= block_len;
-
-	/*
-	 * Windows NCM driver avoids USB ZLPs by adding a 1-byte
-	 * zero pad as needed.
-	 */
-	if (to_process == 1 &&
-	    (*(unsigned char *)(ntb_ptr + block_len) == 0x00)) {
-		to_process--;
-	} else if ((to_process > 0) && (block_len != 0)) {
+	if (to_process != 0) {
 		ntb_ptr = (unsigned char *)(ntb_ptr + block_len);
 		goto parse_ntb;
 	}
@@ -1471,8 +1463,6 @@ static int ncm_bind(struct usb_configuration *c, struct usb_function *f)
 		goto fail;
 
 	ncm_opts->bound = true;
-
-	ncm_string_defs[1].s = ncm->ethaddr;
 
 	us = usb_gstrings_attach(cdev, ncm_strings,
 				 ARRAY_SIZE(ncm_string_defs));
@@ -1722,14 +1712,6 @@ static struct usb_function_instance *ncm_alloc_inst(void)
 		return ERR_CAST(ncm_interf_group);
 	}
 	opts->ncm_interf_group = ncm_interf_group;
-
-#ifdef CONFIG_USB_CONFIGFS_UEVENT
-	_ncm_setup_desc = kzalloc(sizeof(*_ncm_setup_desc), GFP_KERNEL);
-	if (!_ncm_setup_desc)
-		return ERR_PTR(-ENOMEM);
-	INIT_WORK(&_ncm_setup_desc->work, ncm_setup_work);
-	_ncm_setup_desc->device = create_function_device("f_ncm");
-#endif
 
 	return &opts->func_inst;
 }

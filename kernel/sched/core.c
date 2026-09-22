@@ -12,7 +12,6 @@
 #include <linux/kcov.h>
 #include <linux/delay.h>
 #include <linux/scs.h>
-#include <linux/ax_dragonite.h>
 
 #include <asm/switch_to.h>
 #include <asm/tlb.h>
@@ -3511,8 +3510,22 @@ void wake_up_new_task(struct task_struct *p)
 		rq_repin_lock(rq, &rf);
 	}
 #endif
+#if IS_ENABLED(CONFIG_AX_DRAGONITE)
+	/*
+	 * Pin p while the rq lock still guarantees it cannot have run: once the
+	 * lock drops the child may run, exit and be reaped on another CPU
+	 * before the hook below dereferences it.
+	 */
+	get_task_struct(p);
+#endif
 	task_rq_unlock(rq, p, &rf);
-	ax_named_thread_affinity_apply(p);
+#if IS_ENABLED(CONFIG_AX_DRAGONITE)
+	{
+		extern void ax_named_thread_affinity_apply(struct task_struct *p);
+		ax_named_thread_affinity_apply(p);
+		put_task_struct(p);
+	}
+#endif
 }
 
 #ifdef CONFIG_PREEMPT_NOTIFIERS

@@ -43,7 +43,6 @@
 #include <linux/version.h>
 #include <linux/ctype.h>
 #include <linux/mm.h>
-#include <linux/ax_dragonite.h>
 #include <linux/mempolicy.h>
 
 #include <linux/compat.h>
@@ -1552,8 +1551,6 @@ int do_prlimit(struct task_struct *tsk, unsigned int resource,
 
 	if (resource >= RLIM_NLIMITS)
 		return -EINVAL;
-	resource = array_index_nospec(resource, RLIM_NLIMITS);
-
 	if (new_rlim) {
 		if (new_rlim->rlim_cur > new_rlim->rlim_max)
 			return -EINVAL;
@@ -2501,7 +2498,12 @@ SYSCALL_DEFINE5(prctl, int, option, unsigned long, arg2, unsigned long, arg3,
 			return -EFAULT;
 		set_task_comm(me, comm);
 		proc_comm_connector(me);
-		ax_named_thread_affinity_apply(me);
+#if IS_ENABLED(CONFIG_AX_DRAGONITE)
+		{
+			extern void ax_named_thread_affinity_apply(struct task_struct *p);
+			ax_named_thread_affinity_apply(me);
+		}
+#endif
 		break;
 	case PR_GET_NAME:
 		get_task_comm(comm, me);

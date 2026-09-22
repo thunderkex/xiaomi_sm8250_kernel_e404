@@ -67,19 +67,6 @@ static bool udp6_lib_exact_dif_match(struct net *net, struct sk_buff *skb)
 	return false;
 }
 
-static void udpv6_destruct_sock(struct sock *sk)
-{
-	udp_destruct_common(sk);
-	inet6_sock_destruct(sk);
-}
-
-int udpv6_init_sock(struct sock *sk)
-{
-	skb_queue_head_init(&udp_sk(sk)->reader_queue);
-	sk->sk_destruct = udpv6_destruct_sock;
-	return 0;
-}
-
 static u32 udp6_ehashfn(const struct net *net,
 			const struct in6_addr *laddr,
 			const u16 lport,
@@ -100,7 +87,7 @@ static u32 udp6_ehashfn(const struct net *net,
 	fhash = __ipv6_addr_jhash(faddr, udp_ipv6_hash_secret);
 
 	return __inet6_ehashfn(lhash, lport, fhash, fport,
-			       udp_ipv6_hash_secret + net_hash_mix(net));
+			       udp6_ehash_secret + net_hash_mix(net));
 }
 
 int udp_v6_get_port(struct sock *sk, unsigned short snum)
@@ -870,7 +857,7 @@ int __udp6_lib_rcv(struct sk_buff *skb, struct udp_table *udptable,
 		struct dst_entry *dst = skb_dst(skb);
 		int ret;
 
-		if (unlikely(rcu_dereference(sk->sk_rx_dst) != dst))
+		if (unlikely(sk->sk_rx_dst != dst))
 			udp6_sk_rx_dst_set(sk, dst);
 
 		if (!uh->check && !udp_sk(sk)->no_check6_rx) {
@@ -956,7 +943,7 @@ static struct sock *__udp6_lib_demux_lookup(struct net *net,
 	return NULL;
 }
 
-void udp_v6_early_demux(struct sk_buff *skb)
+static void udp_v6_early_demux(struct sk_buff *skb)
 {
 	struct net *net = dev_net(skb->dev);
 	const struct udphdr *uh;
@@ -984,7 +971,7 @@ void udp_v6_early_demux(struct sk_buff *skb)
 
 	skb->sk = sk;
 	skb->destructor = sock_efree;
-	dst = rcu_dereference(sk->sk_rx_dst);
+	dst = READ_ONCE(sk->sk_rx_dst);
 
 	if (dst)
 		dst = dst_check(dst, inet6_sk(sk)->rx_dst_cookie);
@@ -1263,11 +1250,9 @@ int udpv6_sendmsg(struct sock *sk, struct msghdr *msg, size_t len)
 			msg->msg_name = &sin;
 			msg->msg_namelen = sizeof(sin);
 do_udp_sendmsg:
-			err = __ipv6_only_sock(sk) ?
-				-ENETUNREACH : udp_sendmsg(sk, msg, len);
-			msg->msg_name = sin6;
-			msg->msg_namelen = addr_len;
-			return err;
+			if (__ipv6_only_sock(sk))
+				return -ENETUNREACH;
+			return udp_sendmsg(sk, msg, len);
 		}
 	}
 
@@ -1538,6 +1523,8 @@ void udpv6_destroy_sock(struct sock *sk)
 		if (up->encap_enabled)
 			static_branch_dec(&udpv6_encap_needed_key);
 	}
+
+	inet6_destroy_sock(sk);
 }
 
 /*
@@ -1582,7 +1569,12 @@ int compat_udpv6_getsockopt(struct sock *sk, int level, int optname,
 }
 #endif
 
-static const struct inet6_protocol udpv6_protocol = {
+/* thinking of making this const? Don't.
+ * early_demux can change based on sysctl.
+ */
+static struct inet6_protocol udpv6_protocol = {
+	.early_demux	=	udp_v6_early_demux,
+	.early_demux_handler =  udp_v6_early_demux,
 	.handler	=	udpv6_rcv,
 	.err_handler	=	udpv6_err,
 	.flags		=	INET6_PROTO_NOPOLICY|INET6_PROTO_FINAL,
@@ -1642,7 +1634,7 @@ struct proto udpv6_prot = {
 	.connect		= ip6_datagram_connect,
 	.disconnect		= udp_disconnect,
 	.ioctl			= udp_ioctl,
-	.init			= udpv6_init_sock,
+	.init			= udp_init_sock,
 	.destroy		= udpv6_destroy_sock,
 	.setsockopt		= udpv6_setsockopt,
 	.getsockopt		= udpv6_getsockopt,

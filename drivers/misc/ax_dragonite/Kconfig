@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: GPL-2.0-only
 config AX_DRAGONITE
 	bool "AxDragonite scene-boost kernel support"
-	depends on PROC_FS
 	default y
 	help
 	  Exposes /proc/ax_dragonite and /proc/ax_named_thread_affinity
