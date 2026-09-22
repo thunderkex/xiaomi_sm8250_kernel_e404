@@ -1964,6 +1964,7 @@ acpi_walk_err:
 		vmbus_acpi_remove(device);
 	return ret_val;
 }
+EXPORT_SYMBOL_GPL(vmbus_device_unregister);
 
 static const struct acpi_device_id vmbus_acpi_device_ids[] = {
 	{"VMBUS", 0},
