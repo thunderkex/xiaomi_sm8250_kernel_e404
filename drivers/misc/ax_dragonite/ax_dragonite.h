@@ -16,24 +16,13 @@
 #include <linux/version.h>
 
 #define AX_MAX_AFFINITY_RULES 32
-#define AX_MAX_BOOST_ENTRIES 128
+#define AX_MAX_BOOST_ENTRIES 32
 #define AX_DRAGONITE_TAG "ax_dragonite: "
 
-/*
- * Every boost / swappiness lease auto-expires so a crashed or restarted
- * framework can never leave a task boosted (or vm.swappiness overridden)
- * forever. Userspace must re-acquire to extend a lease longer than this.
- */
-#define AX_LEASE_TTL_MS  15000
-#define AX_LEASE_REAP_MS 1000
-
 struct ax_boost_entry {
-	struct pid *spid;	/* holds a ref: immune to pid-number reuse */
-	pid_t pid;		/* number as seen by the writer, display only */
-	int saved_nice;		/* nice value before the first acquire */
-	int applied_nice;	/* nice value we set (used to detect foreign changes) */
+	pid_t pid;
+	int saved_nice;
 	int level;
-	unsigned long expires;	/* jiffies */
 	bool active;
 };
 
@@ -44,9 +33,7 @@ extern bool ax_named_affinity_enabled;
 /* Permission validator */
 static inline bool ax_dragonite_is_authorized(void)
 {
-	/* _noaudit: don't spam SELinux avc logs for every unprivileged probe */
-	if (has_capability_noaudit(current, CAP_SYS_NICE) ||
-	    has_capability_noaudit(current, CAP_SYS_ADMIN))
+	if (capable(CAP_SYS_NICE) || capable(CAP_SYS_ADMIN))
 		return true;
 	if (uid_eq(current_euid(), GLOBAL_ROOT_UID))
 		return true;

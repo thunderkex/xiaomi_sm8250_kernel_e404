@@ -3,11 +3,8 @@
  * AxDragonite Core Driver
  *
  * Exposes:
- *  - /proc/ax_dragonite/kswapd_pin: pins kswapd/ksmd kernel threads
+ *  - /proc/ax_dragonite/kswapd_pin: pins kswapd threads across NUMA nodes
  *  - /proc/ax_dragonite/boost: elevates priority of designated task (CFS/PELT)
- *  - /proc/ax_dragonite/swappiness_override: refcounted vm.swappiness lease
- *
- * All leases (boost, swappiness) auto-expire after AX_LEASE_TTL_MS.
  */
 
 #include <linux/module.h>
@@ -17,18 +14,13 @@
 #include <linux/seq_file.h>
 #include <linux/uaccess.h>
 #include <linux/sched.h>
-#include <linux/sched/signal.h>
 #include <linux/sched/task.h>
 #include <linux/cpumask.h>
 #include <linux/spinlock.h>
-#include <linux/mutex.h>
-#include <linux/pid.h>
-#include <linux/jiffies.h>
-#include <linux/workqueue.h>
-#include <linux/utsname.h>
 #include <linux/slab.h>
 #include <linux/string.h>
 #include <linux/ctype.h>
+#include <linux/nodemask.h>
 #include <linux/mmzone.h>
 #include <linux/ratelimit.h>
 #include <linux/swap.h>
@@ -45,22 +37,6 @@ static struct ax_boost_entry boost_table[AX_MAX_BOOST_ENTRIES];
 static unsigned long total_boost_count;
 static DEFINE_MUTEX(boost_table_mutex);
 
-/* swappiness lease state (declared early: shared with the lease reaper) */
-static int saved_vm_swappiness;
-static unsigned int swappiness_lease_count;
-static bool swappiness_override_active;
-static unsigned long swappiness_expires;
-static DEFINE_SPINLOCK(swappiness_override_lock);
-
-static void ax_lease_reap_fn(struct work_struct *work);
-static DECLARE_DELAYED_WORK(ax_lease_work, ax_lease_reap_fn);
-
-static inline void ax_lease_kick(void)
-{
-	/* no-op if already pending */
-	schedule_delayed_work(&ax_lease_work, msecs_to_jiffies(AX_LEASE_REAP_MS));
-}
-
 /* CPUMask parser supporting hex ("0f", "0x0f") and cpulist ("0-3", "0,1,2") */
 int ax_parse_cpumask(const char *buf, cpumask_t *mask)
 {
@@ -72,15 +48,14 @@ int ax_parse_cpumask(const char *buf, cpumask_t *mask)
 
 	cpumask_clear(mask);
 
-	/* cpulist format containing '-' or ',' */
+	/* Check if it's cpulist format containing '-' or ',' */
 	if (strchr(buf, '-') || strchr(buf, ',')) {
 		ret = cpulist_parse(buf, mask);
-		if (ret)
-			return ret;
-		goto clamp;
+		if (!ret)
+			return 0;
 	}
 
-	/* hex first ("ff", "0x0f"), then base-0 fallback */
+	/* Try hex parse first (supports "ff", "f", "0x0f", "0f"), fallback to base 0 */
 	ret = kstrtoul(buf, 16, &raw_mask);
 	if (ret < 0)
 		ret = kstrtoul(buf, 0, &raw_mask);
@@ -92,9 +67,6 @@ int ax_parse_cpumask(const char *buf, cpumask_t *mask)
 #else
 	mask->bits[0] = raw_mask & 0xFFFFFFFF;
 #endif
-clamp:
-	/* never hand set_cpus_allowed_ptr() bits for CPUs that cannot exist */
-	cpumask_and(mask, mask, cpu_possible_mask);
 	return 0;
 }
 EXPORT_SYMBOL_GPL(ax_parse_cpumask);
@@ -102,17 +74,15 @@ EXPORT_SYMBOL_GPL(ax_parse_cpumask);
 /* -------------------------------------------------------------------------
  * /proc/ax_dragonite/kswapd_pin
  * ------------------------------------------------------------------------- */
-#define AX_PIN_MAX_TASKS 16
-
 static ssize_t kswapd_pin_write(struct file *file, const char __user *ubuf,
 				size_t count, loff_t *ppos)
 {
 	char kbuf[64];
 	cpumask_t new_mask;
-	struct task_struct *g, *found[AX_PIN_MAX_TASKS];
+	struct task_struct *g, *t;
 	unsigned long flags;
 	size_t len = min(count, sizeof(kbuf) - 1);
-	int ret, i, n = 0;
+	int ret, nid;
 
 	if (!ax_dragonite_is_authorized()) {
 		pr_warn_ratelimited(AX_DRAGONITE_TAG
@@ -135,35 +105,41 @@ static ssize_t kswapd_pin_write(struct file *file, const char __user *ubuf,
 	cpumask_copy(&kswapd_pinned_mask, &new_mask);
 	spin_unlock_irqrestore(&kswapd_pin_lock, flags);
 
-	/*
-	 * kswapd and ksmd are single-threaded kernel processes, so walking
-	 * process leaders is enough (much cheaper than every thread) and the
-	 * PF_KTHREAD test stops an app thread that merely *names* itself
-	 * "kswapd"/"ksmd" from being re-pinned.
-	 *
-	 * Tasks are collected (with a reference) under RCU and acted on after
-	 * rcu_read_unlock(): set_cpus_allowed_ptr() may sleep, and dropping RCU
-	 * in the middle of the list walk would leave the iterator pointing at a
-	 * task that could already have been freed.
-	 */
-	rcu_read_lock();
-	for_each_process(g) {
-		if (!(g->flags & PF_KTHREAD))
-			continue;
-		if (!(g->flags & PF_KSWAPD) &&
-		    strncmp(g->comm, "kswapd", 6) != 0 &&
-		    strncmp(g->comm, "ksmd", 4) != 0)
-			continue;
-		if (n == AX_PIN_MAX_TASKS)
-			break;
-		get_task_struct(g);
-		found[n++] = g;
-	}
-	rcu_read_unlock();
+	/* 1. Pin NUMA node kswapd tasks directly via pgdat */
+	for_each_online_node(nid) {
+		struct pglist_data *pgdat = NODE_DATA(nid);
 
-	for (i = 0; i < n; i++) {
-		set_cpus_allowed_ptr(found[i], &new_mask);
-		put_task_struct(found[i]);
+		if (pgdat && pgdat->kswapd) {
+			get_task_struct(pgdat->kswapd);
+			set_cpus_allowed_ptr(pgdat->kswapd, &new_mask);
+			put_task_struct(pgdat->kswapd);
+		}
+	}
+
+#define AX_PIN_MAX_TASKS 16
+
+	/* 2. Pin any kswapd and ksmd threads found in task list */
+	{
+		struct task_struct *found[AX_PIN_MAX_TASKS];
+		int i, n = 0;
+
+		rcu_read_lock();
+		for_each_process_thread(g, t) {
+			if ((t->flags & PF_KSWAPD) ||
+			    strncmp(t->comm, "kswapd", 6) == 0 ||
+			    strncmp(t->comm, "ksmd", 4) == 0) {
+				if (n < AX_PIN_MAX_TASKS) {
+					get_task_struct(t);
+					found[n++] = t;
+				}
+			}
+		}
+		rcu_read_unlock();
+
+		for (i = 0; i < n; i++) {
+			set_cpus_allowed_ptr(found[i], &new_mask);
+			put_task_struct(found[i]);
+		}
 	}
 
 	return count;
@@ -189,58 +165,16 @@ static int kswapd_pin_open(struct inode *inode, struct file *file)
 
 /* -------------------------------------------------------------------------
  * /proc/ax_dragonite/boost
- *
- * Format: "<pid> [state] [level]"   state: 1=acquire (default) 0=release
- *                                    level: 1=Light(-5) 2=Heavy(-20, default)
  * ------------------------------------------------------------------------- */
-static bool ax_boost_task_alive(struct ax_boost_entry *e)
-{
-	bool alive;
-
-	rcu_read_lock();
-	alive = pid_task(e->spid, PIDTYPE_PID) != NULL;
-	rcu_read_unlock();
-	return alive;
-}
-
-/* Caller holds boost_table_mutex and e->active is true. */
-static void ax_boost_release_locked(struct ax_boost_entry *e)
-{
-	struct task_struct *task;
-
-	rcu_read_lock();
-	task = pid_task(e->spid, PIDTYPE_PID);
-	if (task)
-		get_task_struct(task);
-	rcu_read_unlock();
-
-	if (task) {
-		/*
-		 * Only undo our own change. If the framework re-niced the task
-		 * during the lease (e.g. moved it to background), that newer
-		 * decision wins and must not be overwritten.
-		 */
-		if (task_nice(task) == e->applied_nice)
-			set_user_nice(task, e->saved_nice);
-		put_task_struct(task);
-	}
-
-	put_pid(e->spid);
-	e->spid = NULL;
-	e->pid = 0;
-	e->active = false;
-}
-
 static ssize_t boost_write(struct file *file, const char __user *ubuf,
 			   size_t count, loff_t *ppos)
 {
 	char kbuf[48];
-	char *ptr, *tok;
-	int pid, boost_state = 1, boost_level = 2;
-	struct pid *spid;
+	char *ptr, *pid_str, *state_str, *level_str;
+	int pid, boost_state = 1, boost_level = 2; /* default: acquire, heavy (nice -20) */
 	struct task_struct *task;
+	int i, target_slot = -1, orig_nice = 0;
 	size_t len = min(count, sizeof(kbuf) - 1);
-	int i, target_slot = -1, free_slot = -1, target_nice;
 
 	if (!ax_dragonite_is_authorized()) {
 		pr_warn_ratelimited(AX_DRAGONITE_TAG
@@ -254,34 +188,72 @@ static ssize_t boost_write(struct file *file, const char __user *ubuf,
 	kbuf[len] = '\0';
 	ptr = strim(kbuf);
 
-	tok = strsep(&ptr, " \t");
-	if (!tok || kstrtoint(tok, 10, &pid) < 0 || pid <= 0) {
+	/* Accept "<pid> [state] [level]" (e.g. "1819", "1819 1", "1819 1 1", "1819 0") */
+	pid_str = strsep(&ptr, " \t");
+	if (!pid_str || kstrtoint(pid_str, 10, &pid) < 0 || pid <= 0) {
 		pr_warn_ratelimited(AX_DRAGONITE_TAG "invalid boost pid: %s\n", kbuf);
 		return -EINVAL;
 	}
 
-	/*
-	 * Malformed state/level must be rejected, never defaulted: a garbled
-	 * *release* silently turning into an *acquire* would leave a task at
-	 * nice -20.
-	 */
 	if (ptr) {
 		ptr = skip_spaces(ptr);
-		tok = strsep(&ptr, " \t");
-		if (tok && *tok && kstrtoint(tok, 10, &boost_state) < 0)
-			return -EINVAL;
+		state_str = strsep(&ptr, " \t");
+		if (state_str && kstrtoint(state_str, 10, &boost_state) < 0)
+			boost_state = 1;
 	}
-	if (ptr) {
-		ptr = skip_spaces(ptr);
-		tok = strsep(&ptr, " \t");
-		if (tok && *tok && kstrtoint(tok, 10, &boost_level) < 0)
-			return -EINVAL;
-	}
-	if (boost_level != 1 && boost_level != 2)
-		return -EINVAL;
 
-	if (boost_state <= 0) {
-		/* ---- release ---- */
+	if (ptr) {
+		ptr = skip_spaces(ptr);
+		level_str = strsep(&ptr, " \t");
+		if (level_str && kstrtoint(level_str, 10, &boost_level) < 0)
+			boost_level = 2;
+	}
+
+	if (boost_state > 0) {
+		/* Boost Acquire: Level 1 = Light (-5), Level 2 = Heavy (-20) */
+		int target_nice = (boost_level == 1) ? -5 : -20;
+		int free_slot = -1;
+
+		rcu_read_lock();
+		task = find_task_by_vpid(pid);
+		if (!task) {
+			rcu_read_unlock();
+			return -ESRCH;
+		}
+		get_task_struct(task);
+		rcu_read_unlock();
+
+		mutex_lock(&boost_table_mutex);
+		for (i = 0; i < AX_MAX_BOOST_ENTRIES; i++) {
+			if (boost_table[i].active && boost_table[i].pid == pid) {
+				target_slot = i;
+				break;
+			}
+			if (!boost_table[i].active && free_slot == -1)
+				free_slot = i;
+		}
+
+		if (target_slot == -1) {
+			if (free_slot == -1) {
+				mutex_unlock(&boost_table_mutex);
+				put_task_struct(task);
+				pr_warn_ratelimited(AX_DRAGONITE_TAG "boost table full\n");
+				return -ENOSPC;
+			}
+			target_slot = free_slot;
+			boost_table[target_slot].pid = pid;
+			boost_table[target_slot].saved_nice = task_nice(task);
+			boost_table[target_slot].active = true;
+		}
+		boost_table[target_slot].level = boost_level;
+		total_boost_count++;
+		mutex_unlock(&boost_table_mutex);
+
+		set_user_nice(task, target_nice);
+		wake_up_process(task);
+		put_task_struct(task);
+	} else {
+		/* Boost Release: restore saved prior nice value */
 		mutex_lock(&boost_table_mutex);
 		for (i = 0; i < AX_MAX_BOOST_ENTRIES; i++) {
 			if (boost_table[i].active && boost_table[i].pid == pid) {
@@ -289,106 +261,48 @@ static ssize_t boost_write(struct file *file, const char __user *ubuf,
 				break;
 			}
 		}
+
 		if (target_slot == -1) {
 			mutex_unlock(&boost_table_mutex);
 			return -ENOENT;
 		}
-		ax_boost_release_locked(&boost_table[target_slot]);
+
+		orig_nice = boost_table[target_slot].saved_nice;
+		boost_table[target_slot].active = false;
+		boost_table[target_slot].pid = 0;
 		mutex_unlock(&boost_table_mutex);
-		return count;
-	}
 
-	/* ---- acquire ---- */
-	target_nice = (boost_level == 1) ? -5 : -20;
-
-	spid = find_get_pid(pid);
-	if (!spid)
-		return -ESRCH;
-
-	rcu_read_lock();
-	task = pid_task(spid, PIDTYPE_PID);
-	if (task)
-		get_task_struct(task);
-	rcu_read_unlock();
-	if (!task) {
-		put_pid(spid);
-		return -ESRCH;
-	}
-	if (task->flags & PF_KTHREAD) {
-		put_task_struct(task);
-		put_pid(spid);
-		return -EPERM;
-	}
-
-	mutex_lock(&boost_table_mutex);
-	for (i = 0; i < AX_MAX_BOOST_ENTRIES; i++) {
-		struct ax_boost_entry *e = &boost_table[i];
-
-		/* reclaim slots whose task exited or lease expired */
-		if (e->active && (time_after(jiffies, e->expires) || !ax_boost_task_alive(e)))
-			ax_boost_release_locked(e);
-
-		if (e->active && e->spid == spid) {
-			target_slot = i;
-			break;
-		}
-		if (!e->active && free_slot == -1)
-			free_slot = i;
-	}
-
-	if (target_slot == -1) {
-		if (free_slot == -1) {
-			mutex_unlock(&boost_table_mutex);
+		rcu_read_lock();
+		task = find_task_by_vpid(pid);
+		if (task) {
+			get_task_struct(task);
+			rcu_read_unlock();
+			set_user_nice(task, orig_nice);
 			put_task_struct(task);
-			put_pid(spid);
-			pr_warn_ratelimited(AX_DRAGONITE_TAG "boost table full\n");
-			return -ENOSPC;
+		} else {
+			rcu_read_unlock();
 		}
-		target_slot = free_slot;
-		boost_table[target_slot].spid = spid;	/* table now owns this ref */
-		boost_table[target_slot].pid = pid;
-		boost_table[target_slot].saved_nice = task_nice(task);
-		boost_table[target_slot].active = true;
-	} else {
-		put_pid(spid);	/* entry already holds its own ref */
 	}
-	boost_table[target_slot].level = boost_level;
-	boost_table[target_slot].applied_nice = target_nice;
-	boost_table[target_slot].expires = jiffies + msecs_to_jiffies(AX_LEASE_TTL_MS);
-	total_boost_count++;
 
-	/*
-	 * set_user_nice() stays inside the mutex: dropping it first lets a
-	 * concurrent release run *before* our nice change and then leaves the
-	 * task at -20 with no table entry to ever undo it. It also re-queues
-	 * the task itself, so no wake_up_process() (which would only inject a
-	 * spurious wakeup into interruptible sleepers).
-	 */
-	set_user_nice(task, target_nice);
-	mutex_unlock(&boost_table_mutex);
-
-	put_task_struct(task);
-	ax_lease_kick();
 	return count;
 }
 
 static int boost_show(struct seq_file *m, void *v)
 {
 	int i, active_count = 0;
-	unsigned long total, now = jiffies;
+	unsigned long total;
 
 	mutex_lock(&boost_table_mutex);
 	total = total_boost_count;
-	seq_printf(m, "# pid saved_nice level ttl_ms\n");
+	seq_printf(m, "# pid saved_nice level\n");
 	for (i = 0; i < AX_MAX_BOOST_ENTRIES; i++) {
-		struct ax_boost_entry *e = &boost_table[i];
-
-		if (!e->active)
-			continue;
-		seq_printf(m, "%-8d %-10d %-5d %u\n", e->pid, e->saved_nice, e->level,
-			   time_after(e->expires, now) ?
-			   jiffies_to_msecs(e->expires - now) : 0);
-		active_count++;
+		if (boost_table[i].active) {
+			seq_printf(m, "%-8d %-10d %-5d\n",
+				   boost_table[i].pid,
+				   boost_table[i].saved_nice,
+				   boost_table[i].level);
+			active_count++;
+		}
 	}
 	mutex_unlock(&boost_table_mutex);
 
@@ -404,6 +318,11 @@ static int boost_open(struct inode *inode, struct file *file)
 /* -------------------------------------------------------------------------
  * /proc/ax_dragonite/swappiness_override
  * ------------------------------------------------------------------------- */
+static int saved_vm_swappiness;
+static unsigned int swappiness_lease_count;
+static bool swappiness_override_active;
+static DEFINE_SPINLOCK(swappiness_override_lock);
+
 static ssize_t swappiness_override_write(struct file *file, const char __user *ubuf,
 					 size_t count, loff_t *ppos)
 {
@@ -427,35 +346,32 @@ static ssize_t swappiness_override_write(struct file *file, const char __user *u
 		pr_warn_ratelimited(AX_DRAGONITE_TAG "invalid swappiness value: %s\n", kbuf);
 		return -EINVAL;
 	}
-	if (target_val > 200) {
-		pr_warn_ratelimited(AX_DRAGONITE_TAG "swappiness out of range (0-200): %d\n",
-				    target_val);
-		return -EINVAL;
-	}
 
 	spin_lock_irqsave(&swappiness_override_lock, flags);
 	if (target_val < 0) {
-		/* release: drop one reference, restore on the last one */
-		if (swappiness_lease_count > 0 && --swappiness_lease_count == 0 &&
-		    swappiness_override_active) {
-			vm_swappiness = saved_vm_swappiness;
-			swappiness_override_active = false;
+		/* Release lease: decrement refcount; restore on final release */
+		if (swappiness_lease_count > 0) {
+			swappiness_lease_count--;
+			if (swappiness_lease_count == 0 && swappiness_override_active) {
+				vm_swappiness = saved_vm_swappiness;
+				swappiness_override_active = false;
+			}
 		}
-	} else {
-		/* acquire: remember the pre-boost value only on the first lease */
-		if (!swappiness_override_active) {
+	} else if (target_val <= 200) {
+		/* Acquire lease: save original value on initial acquisition */
+		if (swappiness_lease_count == 0 && !swappiness_override_active) {
 			saved_vm_swappiness = vm_swappiness;
 			swappiness_override_active = true;
-			swappiness_lease_count = 0;
 		}
 		vm_swappiness = target_val;
 		swappiness_lease_count++;
-		swappiness_expires = jiffies + msecs_to_jiffies(AX_LEASE_TTL_MS);
+	} else {
+		spin_unlock_irqrestore(&swappiness_override_lock, flags);
+		pr_warn_ratelimited(AX_DRAGONITE_TAG "swappiness out of range (0-200): %d\n", target_val);
+		return -EINVAL;
 	}
 	spin_unlock_irqrestore(&swappiness_override_lock, flags);
 
-	if (target_val >= 0)
-		ax_lease_kick();
 	return count;
 }
 
@@ -484,50 +400,11 @@ static int swappiness_override_open(struct inode *inode, struct file *file)
 }
 
 /* -------------------------------------------------------------------------
- * Lease reaper: enforces AX_LEASE_TTL_MS for boosts and the swappiness lease
- * and drops boost entries whose task died without a release.
- * ------------------------------------------------------------------------- */
-static void ax_lease_reap_fn(struct work_struct *work)
-{
-	unsigned long now = jiffies, flags;
-	bool more = false;
-	int i;
-
-	mutex_lock(&boost_table_mutex);
-	for (i = 0; i < AX_MAX_BOOST_ENTRIES; i++) {
-		struct ax_boost_entry *e = &boost_table[i];
-
-		if (!e->active)
-			continue;
-		if (time_after(now, e->expires) || !ax_boost_task_alive(e))
-			ax_boost_release_locked(e);
-		else
-			more = true;
-	}
-	mutex_unlock(&boost_table_mutex);
-
-	spin_lock_irqsave(&swappiness_override_lock, flags);
-	if (swappiness_override_active) {
-		if (time_after(now, swappiness_expires)) {
-			vm_swappiness = saved_vm_swappiness;
-			swappiness_override_active = false;
-			swappiness_lease_count = 0;
-		} else {
-			more = true;
-		}
-	}
-	spin_unlock_irqrestore(&swappiness_override_lock, flags);
-
-	if (more)
-		ax_lease_kick();
-}
-
-/* -------------------------------------------------------------------------
  * /proc/ax_dragonite/version
  * ------------------------------------------------------------------------- */
 static int version_show(struct seq_file *m, void *v)
 {
-	seq_printf(m, "AxDragonite %s\n", init_utsname()->release);
+	seq_printf(m, "AxDragonite 4.19.404R-dragonite\n");
 	return 0;
 }
 
@@ -633,7 +510,6 @@ static int __init ax_dragonite_core_init(void)
 
 static void __exit ax_dragonite_core_exit(void)
 {
-	cancel_delayed_work_sync(&ax_lease_work);
 	ax_named_thread_affinity_exit();
 
 	if (ax_dragonite_dir) {

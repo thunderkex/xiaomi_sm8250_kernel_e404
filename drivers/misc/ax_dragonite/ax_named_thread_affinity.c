@@ -5,10 +5,7 @@
  * Exposes:
  *  - /proc/ax_named_thread_affinity/rules: register affinity rules (<comm> <mask>)
  *  - /proc/ax_named_thread_affinity/enabled: runtime toggle switch
- *  - Affinity applied at PR_SET_NAME (thread names itself) and, as a
- *    fallback for inherited comms, right after wake_up_new_task() drops
- *    its rq/pi locks. It must NEVER be called from a wakeup path
- *    (ttwu_do_wakeup): that runs under rq->lock with IRQs off.
+ *  - Opportunistic affinity application on wake_up_new_task
  */
 
 #include <linux/module.h>
@@ -25,15 +22,13 @@
 #include <linux/string.h>
 #include <linux/ctype.h>
 #include <linux/ratelimit.h>
-#include <linux/rcupdate.h>
-#include <linux/atomic.h>
 
 #include "ax_dragonite.h"
 
 struct named_affinity_rule {
 	char comm[TASK_COMM_LEN];
 	cpumask_t mask;
-	atomic_long_t applied_count;
+	unsigned long applied_count;
 	bool active;
 };
 
@@ -46,56 +41,39 @@ EXPORT_SYMBOL_GPL(ax_named_affinity_enabled);
 static struct named_affinity_rule affinity_rules[AX_MAX_AFFINITY_RULES];
 static DEFINE_MUTEX(affinity_mutex);
 
-/* Apply mask to already-running user threads matching comm (single bounded pass) */
-#define AX_AFFINITY_BATCH 128
+#define AX_AFFINITY_BATCH_SIZE 32
 
+/* Apply mask to all currently existing threads matching comm */
 static void apply_named_affinity_to_tasks(const char *comm, const cpumask_t *mask)
 {
 	struct task_struct *g, *t;
-	struct task_struct *batch[AX_AFFINITY_BATCH];
-	int i, n = 0;
-	bool truncated = false;
+	struct task_struct *batch[AX_AFFINITY_BATCH_SIZE];
+	int count, i;
 
-	/*
-	 * Collect (with references) under RCU, act after rcu_read_unlock():
-	 * set_cpus_allowed_ptr() can sleep, and unlocking mid-walk would leave
-	 * the iterator on a task that may already be freed. Threads beyond the
-	 * batch (or created later) still get the rule via PR_SET_NAME.
-	 */
-	rcu_read_lock();
-	for_each_process_thread(g, t) {
-		if ((t->flags & PF_KTHREAD) ||
-		    strncmp(t->comm, comm, TASK_COMM_LEN) != 0)
-			continue;
-		if (n == AX_AFFINITY_BATCH) {
-			truncated = true;
-			break;
+	do {
+		count = 0;
+		rcu_read_lock();
+		for_each_process_thread(g, t) {
+			if (strncmp(t->comm, comm, TASK_COMM_LEN) == 0 &&
+			    !cpumask_equal(&t->cpus_allowed, mask)) {
+				get_task_struct(t);
+				batch[count++] = t;
+				if (count == AX_AFFINITY_BATCH_SIZE)
+					break;
+			}
 		}
-		get_task_struct(t);
-		batch[n++] = t;
-	}
-	rcu_read_unlock();
+		rcu_read_unlock();
 
-	for (i = 0; i < n; i++) {
-		set_cpus_allowed_ptr(batch[i], mask);
-		put_task_struct(batch[i]);
-	}
-
-	if (truncated)
-		pr_warn_ratelimited(AX_DRAGONITE_TAG
-				    "affinity rule '%s': >%d live threads, remainder applied on rename only\n",
-				    comm, AX_AFFINITY_BATCH);
+		for (i = 0; i < count; i++) {
+			set_cpus_allowed_ptr(batch[i], mask);
+			put_task_struct(batch[i]);
+		}
+	} while (count == AX_AFFINITY_BATCH_SIZE);
 }
 
-/*
- * Named affinity hook: PR_SET_NAME (p == current) and wake_up_new_task()
- * (caller holds a reference on p, taken while the rq lock was still held).
- * Runs in preemptible process context, so set_cpus_allowed_ptr() may sleep.
- */
+/* Named affinity hook called from wake_up_new_task() post-unlock and PR_SET_NAME */
 void ax_named_thread_affinity_apply(struct task_struct *p)
 {
-	cpumask_t mask;
-	bool hit = false;
 	int i;
 
 	if (!READ_ONCE(ax_named_affinity_enabled))
@@ -104,42 +82,36 @@ void ax_named_thread_affinity_apply(struct task_struct *p)
 	if (!p || (p->flags & PF_KTHREAD))
 		return;
 
-	/*
-	 * The mask is copied while still inside the RCU section: rules_write()
-	 * calls synchronize_rcu() before it edits a live slot, so we can never
-	 * observe a half-rewritten comm/mask pair.
-	 */
 	rcu_read_lock();
 	for (i = 0; i < AX_MAX_AFFINITY_RULES; i++) {
 		if (smp_load_acquire(&affinity_rules[i].active) &&
 		    strncmp(p->comm, affinity_rules[i].comm, TASK_COMM_LEN) == 0) {
+			cpumask_t mask;
+
 			cpumask_copy(&mask, &affinity_rules[i].mask);
-			atomic_long_inc(&affinity_rules[i].applied_count);
-			hit = true;
-			break;
+			if (cpumask_empty(&mask)) {
+				rcu_read_unlock();
+				return;
+			}
+			affinity_rules[i].applied_count++;
+			rcu_read_unlock();
+			set_cpus_allowed_ptr(p, &mask);
+			return;
 		}
 	}
 	rcu_read_unlock();
-
-	if (hit && !cpumask_empty(&mask))
-		set_cpus_allowed_ptr(p, &mask);
 }
 EXPORT_SYMBOL_GPL(ax_named_thread_affinity_apply);
 
 /* -------------------------------------------------------------------------
  * /proc/ax_named_thread_affinity/rules
- *
- * Write "<comm> <hexmask|cpulist>" to add/replace a rule, or "<comm> -" to
- * remove it (removal does not restore affinity of threads already pinned).
  * ------------------------------------------------------------------------- */
 static ssize_t rules_write(struct file *file, const char __user *ubuf,
 			   size_t count, loff_t *ppos)
 {
 	char kbuf[128];
-	char comm[TASK_COMM_LEN];
 	char *comm_str, *mask_str, *ptr;
 	cpumask_t mask;
-	bool remove;
 	int i, free_slot = -1, target_slot = -1;
 	size_t len = min(count, sizeof(kbuf) - 1);
 
@@ -155,24 +127,16 @@ static ssize_t rules_write(struct file *file, const char __user *ubuf,
 	kbuf[len] = '\0';
 	ptr = strim(kbuf);
 
+	/* Expect "<comm> <hex_mask_or_cpulist>" */
 	comm_str = strsep(&ptr, " \t");
 	mask_str = ptr ? strim(ptr) : NULL;
 
-	if (!comm_str || !mask_str || strlen(comm_str) == 0 || *mask_str == '\0') {
+	if (!comm_str || !mask_str || strlen(comm_str) == 0) {
 		pr_warn_ratelimited(AX_DRAGONITE_TAG "malformed rule input: %s\n", kbuf);
 		return -EINVAL;
 	}
 
-	/*
-	 * Task names are truncated to TASK_COMM_LEN-1 by the kernel. Truncate
-	 * the rule the same way, otherwise a >15 char name never matches any
-	 * thread and every rewrite of it burns a fresh table slot.
-	 */
-	strlcpy(comm, comm_str, sizeof(comm));
-
-	remove = !strcmp(mask_str, "-");
-	if (!remove &&
-	    (ax_parse_cpumask(mask_str, &mask) < 0 || cpumask_empty(&mask))) {
+	if (ax_parse_cpumask(mask_str, &mask) < 0 || cpumask_empty(&mask)) {
 		pr_warn_ratelimited(AX_DRAGONITE_TAG "invalid cpumask in rule: %s\n", mask_str);
 		return -EINVAL;
 	}
@@ -180,7 +144,7 @@ static ssize_t rules_write(struct file *file, const char __user *ubuf,
 	mutex_lock(&affinity_mutex);
 	for (i = 0; i < AX_MAX_AFFINITY_RULES; i++) {
 		if (affinity_rules[i].active &&
-		    strncmp(affinity_rules[i].comm, comm, TASK_COMM_LEN) == 0) {
+		    strncmp(affinity_rules[i].comm, comm_str, TASK_COMM_LEN) == 0) {
 			target_slot = i;
 			break;
 		}
@@ -188,32 +152,13 @@ static ssize_t rules_write(struct file *file, const char __user *ubuf,
 			free_slot = i;
 	}
 
-	if (remove) {
-		if (target_slot == -1) {
-			mutex_unlock(&affinity_mutex);
-			return -ENOENT;
-		}
-		smp_store_release(&affinity_rules[target_slot].active, false);
-		mutex_unlock(&affinity_mutex);
-		return count;
-	}
-
-	if (target_slot != -1) {
-		/*
-		 * Editing a live slot: unpublish and wait out readers first,
-		 * otherwise a CPU in ax_named_thread_affinity_apply() can read
-		 * a comm/mask pair that is half old, half new.
-		 */
-		smp_store_release(&affinity_rules[target_slot].active, false);
-		synchronize_rcu();
-	} else {
+	if (target_slot == -1)
 		target_slot = free_slot;
-	}
 
 	if (target_slot != -1) {
-		strlcpy(affinity_rules[target_slot].comm, comm, TASK_COMM_LEN);
+		strlcpy(affinity_rules[target_slot].comm, comm_str, TASK_COMM_LEN);
 		cpumask_copy(&affinity_rules[target_slot].mask, &mask);
-		atomic_long_set(&affinity_rules[target_slot].applied_count, 0);
+		affinity_rules[target_slot].applied_count++;
 		smp_store_release(&affinity_rules[target_slot].active, true);
 	}
 	mutex_unlock(&affinity_mutex);
@@ -224,7 +169,7 @@ static ssize_t rules_write(struct file *file, const char __user *ubuf,
 	}
 
 	/* Apply immediately to running threads matching this comm */
-	apply_named_affinity_to_tasks(comm, &mask);
+	apply_named_affinity_to_tasks(comm_str, &mask);
 
 	return count;
 }
@@ -239,10 +184,10 @@ static int rules_show(struct seq_file *m, void *v)
 	for (i = 0; i < AX_MAX_AFFINITY_RULES; i++) {
 		if (affinity_rules[i].active) {
 			cpumap_print_to_pagebuf(false, mask_str, &affinity_rules[i].mask);
-			seq_printf(m, "%-16s %s %ld\n",
+			seq_printf(m, "%-16s %s %lu\n",
 				   affinity_rules[i].comm,
 				   strim(mask_str),
-				   atomic_long_read(&affinity_rules[i].applied_count));
+				   affinity_rules[i].applied_count);
 		}
 	}
 	mutex_unlock(&affinity_mutex);
