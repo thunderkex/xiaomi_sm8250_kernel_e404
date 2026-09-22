@@ -140,7 +140,7 @@ config ZRAM_MULTI_COMP
 config KCOMPRESSD
 	tristate "Kcompressd: Accelerated zram compression"
 	depends on ZRAM
-	default y
+	default n
 	help
 	Kcompressd creates multiple daemons to accelerate compression
 	of pages in zram, offloading this from kswapd/direct reclaim.
