@@ -16,7 +16,7 @@
 #include <linux/version.h>
 
 #define AX_MAX_AFFINITY_RULES 32
-#define AX_MAX_BOOST_ENTRIES 32
+#define AX_MAX_BOOST_ENTRIES 128
 #define AX_DRAGONITE_TAG "ax_dragonite: "
 
 struct ax_boost_entry {
