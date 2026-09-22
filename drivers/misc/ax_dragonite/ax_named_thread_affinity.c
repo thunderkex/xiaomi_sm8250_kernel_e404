@@ -44,13 +44,11 @@ static DEFINE_MUTEX(affinity_mutex);
 #define AX_AFFINITY_BATCH_SIZE 32
 
 /* Apply mask to all currently existing threads matching comm */
-static unsigned long apply_named_affinity_to_tasks(const char *comm,
-						    const cpumask_t *mask)
+static void apply_named_affinity_to_tasks(const char *comm, const cpumask_t *mask)
 {
 	struct task_struct *g, *t;
 	struct task_struct *batch[AX_AFFINITY_BATCH_SIZE];
 	int count, i;
-	unsigned long total_applied = 0;
 
 	do {
 		count = 0;
@@ -70,10 +68,7 @@ static unsigned long apply_named_affinity_to_tasks(const char *comm,
 			set_cpus_allowed_ptr(batch[i], mask);
 			put_task_struct(batch[i]);
 		}
-		total_applied += count;
 	} while (count == AX_AFFINITY_BATCH_SIZE);
-
-	return total_applied;
 }
 
 /* Named affinity hook called from wake_up_new_task() post-unlock and PR_SET_NAME */
@@ -135,60 +130,24 @@ static ssize_t rules_write(struct file *file, const char __user *ubuf,
 	kbuf[len] = '\0';
 	ptr = strim(kbuf);
 
-	/* Expect "<comm> <hex_mask_or_cpulist>" or "!<comm>" */
+	/* Expect "<comm> <hex_mask_or_cpulist>" */
 	comm_str = strsep(&ptr, " \t");
 	mask_str = ptr ? strim(ptr) : NULL;
 
-	if (!comm_str || strlen(comm_str) == 0) {
+	if (!comm_str || !mask_str || strlen(comm_str) == 0) {
 		pr_warn_ratelimited(AX_DRAGONITE_TAG "malformed rule input: %s\n", kbuf);
 		return -EINVAL;
 	}
 
-	if (comm_str[0] == '!') {
-		is_delete = true;
-		strlcpy(target_comm, comm_str + 1, TASK_COMM_LEN);
-	} else {
-		strlcpy(target_comm, comm_str, TASK_COMM_LEN);
-		if (mask_str && (!strcmp(mask_str, "0") ||
-				 !strcasecmp(mask_str, "none") ||
-				 !strcasecmp(mask_str, "reset") ||
-				 !strcasecmp(mask_str, "del")))
-			is_delete = true;
-	}
-
-	if (is_delete) {
-		mutex_lock(&affinity_mutex);
-		for (i = 0; i < AX_MAX_AFFINITY_RULES; i++) {
-			if (affinity_rules[i].active &&
-			    strncmp(affinity_rules[i].comm, target_comm,
-				    TASK_COMM_LEN) == 0) {
-				/* Pairs with smp_load_acquire in apply hook */
-				smp_store_release(&affinity_rules[i].active,
-						  false);
-				affinity_rules[i].comm[0] = '\0';
-				cpumask_clear(&affinity_rules[i].mask);
-				target_slot = i;
-				break;
-			}
-		}
-		mutex_unlock(&affinity_mutex);
-		if (target_slot == -1)
-			return -ENOENT;
-		return count;
-	}
-
-	if (!mask_str || ax_parse_cpumask(mask_str, &mask) < 0 ||
-	    cpumask_empty(&mask)) {
-		pr_warn_ratelimited(AX_DRAGONITE_TAG "invalid cpumask in rule: %s\n",
-				    mask_str ? mask_str : "NULL");
+	if (ax_parse_cpumask(mask_str, &mask) < 0 || cpumask_empty(&mask)) {
+		pr_warn_ratelimited(AX_DRAGONITE_TAG "invalid cpumask in rule: %s\n", mask_str);
 		return -EINVAL;
 	}
 
 	mutex_lock(&affinity_mutex);
 	for (i = 0; i < AX_MAX_AFFINITY_RULES; i++) {
 		if (affinity_rules[i].active &&
-		    strncmp(affinity_rules[i].comm, target_comm,
-			    TASK_COMM_LEN) == 0) {
+		    strncmp(affinity_rules[i].comm, comm_str, TASK_COMM_LEN) == 0) {
 			target_slot = i;
 			break;
 		}
@@ -200,9 +159,9 @@ static ssize_t rules_write(struct file *file, const char __user *ubuf,
 		target_slot = free_slot;
 
 	if (target_slot != -1) {
-		strlcpy(affinity_rules[target_slot].comm, target_comm,
-			TASK_COMM_LEN);
+		strlcpy(affinity_rules[target_slot].comm, comm_str, TASK_COMM_LEN);
 		cpumask_copy(&affinity_rules[target_slot].mask, &mask);
+		affinity_rules[target_slot].applied_count++;
 		smp_store_release(&affinity_rules[target_slot].active, true);
 	}
 	mutex_unlock(&affinity_mutex);
@@ -213,15 +172,7 @@ static ssize_t rules_write(struct file *file, const char __user *ubuf,
 	}
 
 	/* Apply immediately to running threads matching this comm */
-	applied = apply_named_affinity_to_tasks(target_comm, &mask);
-	if (applied) {
-		mutex_lock(&affinity_mutex);
-		if (affinity_rules[target_slot].active &&
-		    strncmp(affinity_rules[target_slot].comm, target_comm,
-			    TASK_COMM_LEN) == 0)
-			affinity_rules[target_slot].applied_count += applied;
-		mutex_unlock(&affinity_mutex);
-	}
+	apply_named_affinity_to_tasks(comm_str, &mask);
 
 	return count;
 }

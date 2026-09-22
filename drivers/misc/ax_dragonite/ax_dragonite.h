@@ -20,10 +20,8 @@
 #define AX_DRAGONITE_TAG "ax_dragonite: "
 
 struct ax_boost_entry {
-	struct pid *spid;
 	pid_t pid;
 	int saved_nice;
-	int applied_nice;
 	int level;
 	bool active;
 };
