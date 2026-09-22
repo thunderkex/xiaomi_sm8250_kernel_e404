@@ -27,6 +27,7 @@
 #include <linux/cpuhotplug.h>
 #include <linux/jiffies.h>
 #include <linux/workqueue.h>
+#include <linux/utsname.h>
 
 #include "ax_dragonite.h"
 
@@ -507,7 +508,7 @@ static int swappiness_override_open(struct inode *inode, struct file *file)
  * ------------------------------------------------------------------------- */
 static int version_show(struct seq_file *m, void *v)
 {
-	seq_printf(m, "AxDragonite 4.19.404R-dragonite\n");
+	seq_printf(m, "AxDragonite %s\n", init_utsname()->release);
 	return 0;
 }
 
@@ -592,6 +593,7 @@ static const struct file_operations version_ops = {
  * ------------------------------------------------------------------------- */
 static int __init ax_dragonite_core_init(void)
 {
+	struct proc_dir_entry *entry;
 	int ret;
 
 	cpumask_clear(&kswapd_pinned_mask);
@@ -602,12 +604,27 @@ static int __init ax_dragonite_core_init(void)
 		return -ENOMEM;
 	}
 
-	proc_create("kswapd_pin", 0640, ax_dragonite_dir, &kswapd_pin_ops);
-	proc_create("boost", 0640, ax_dragonite_dir, &boost_ops);
-	proc_create("swappiness_override", 0640, ax_dragonite_dir, &swappiness_override_ops);
-	proc_create("version", 0444, ax_dragonite_dir, &version_ops);
+	entry = proc_create("kswapd_pin", 0640, ax_dragonite_dir,
+			    &kswapd_pin_ops);
+	if (!entry)
+		goto err_kswapd_pin;
 
-	ax_named_thread_affinity_init();
+	entry = proc_create("boost", 0640, ax_dragonite_dir, &boost_ops);
+	if (!entry)
+		goto err_boost;
+
+	entry = proc_create("swappiness_override", 0640, ax_dragonite_dir,
+			    &swappiness_override_ops);
+	if (!entry)
+		goto err_swappiness;
+
+	entry = proc_create("version", 0444, ax_dragonite_dir, &version_ops);
+	if (!entry)
+		goto err_version;
+
+	ret = ax_named_thread_affinity_init();
+	if (ret)
+		goto err_affinity;
 
 	ret = cpuhp_setup_state_nocalls(CPUHP_AP_ONLINE_DYN,
 					"ax_dragonite/kswapd:online",
@@ -617,6 +634,19 @@ static int __init ax_dragonite_core_init(void)
 
 	pr_info(AX_DRAGONITE_TAG "driver initialized successfully\n");
 	return 0;
+
+err_affinity:
+	remove_proc_entry("version", ax_dragonite_dir);
+err_version:
+	remove_proc_entry("swappiness_override", ax_dragonite_dir);
+err_swappiness:
+	remove_proc_entry("boost", ax_dragonite_dir);
+err_boost:
+	remove_proc_entry("kswapd_pin", ax_dragonite_dir);
+err_kswapd_pin:
+	remove_proc_entry("ax_dragonite", NULL);
+	ax_dragonite_dir = NULL;
+	return -ENOMEM;
 }
 
 static void __exit ax_dragonite_core_exit(void)

@@ -334,19 +334,39 @@ static const struct file_operations enabled_ops = {
  */
 int ax_named_thread_affinity_init(void)
 {
+	struct proc_dir_entry *entry;
+
 	ax_named_affinity_dir = proc_mkdir("ax_named_thread_affinity", NULL);
 	if (!ax_named_affinity_dir) {
 		pr_err(AX_DRAGONITE_TAG "failed to create /proc/ax_named_thread_affinity\n");
 		return -ENOMEM;
 	}
 
-	proc_create("rules", 0640, ax_named_affinity_dir, &rules_ops);
-	proc_create("enabled", 0640, ax_named_affinity_dir, &enabled_ops);
+	entry = proc_create("rules", 0640, ax_named_affinity_dir, &rules_ops);
+	if (!entry)
+		goto err_rules;
+
+	entry = proc_create("enabled", 0640, ax_named_affinity_dir,
+			    &enabled_ops);
+	if (!entry)
+		goto err_enabled;
 
 	/* Compatibility node at /proc/ax_named_thread_affinity_rules */
-	proc_create("ax_named_thread_affinity_rules", 0640, NULL, &rules_ops);
+	entry = proc_create("ax_named_thread_affinity_rules", 0640, NULL,
+			    &rules_ops);
+	if (!entry)
+		goto err_compat;
 
 	return 0;
+
+err_compat:
+	remove_proc_entry("enabled", ax_named_affinity_dir);
+err_enabled:
+	remove_proc_entry("rules", ax_named_affinity_dir);
+err_rules:
+	remove_proc_entry("ax_named_thread_affinity", NULL);
+	ax_named_affinity_dir = NULL;
+	return -ENOMEM;
 }
 
 void ax_named_thread_affinity_exit(void)
