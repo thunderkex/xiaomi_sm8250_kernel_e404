@@ -19,12 +19,20 @@
 #define AX_MAX_BOOST_ENTRIES 128
 #define AX_DRAGONITE_TAG "ax_dragonite: "
 
+/*
+ * Every boost lease auto-expires so a crashed/killed userspace engine can
+ * never leave a task boosted forever; the owner must re-acquire to extend
+ * a lease longer than this (mirrors the swappiness_override lease).
+ */
+#define AX_BOOST_LEASE_TTL_MS  15000
+
 struct ax_boost_entry {
 	struct pid *spid;
 	pid_t pid;
 	int saved_nice;
 	int applied_nice;
 	int level;
+	unsigned long expires;	/* jiffies */
 	bool active;
 };
 

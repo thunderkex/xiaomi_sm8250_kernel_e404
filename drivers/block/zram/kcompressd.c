@@ -51,7 +51,7 @@ int kcompressd_enabled(void)
 }
 EXPORT_SYMBOL(kcompressd_enabled);
 
-static int kcompressd(void *para)
+static int zram_kcompressd(void *para)
 {
 	struct task_struct *tsk = current;
 	struct kcompressd_para *p = (struct kcompressd_para *)para;
@@ -190,8 +190,8 @@ int schedule_bio_write(void *mem, struct bio *bio, compress_callback cb)
 			switch (atomic_read(&kcompress[idx].running)) {
 			case KCOMPRESSD_NOT_STARTED:
 				atomic_set(&kcompress[idx].running, KCOMPRESSD_RUNNING);
-				kcompress[idx].kcompressd = kthread_run(kcompressd,
-						&kcompressd_para[idx], "kcompressd:%d", idx);
+				kcompress[idx].kcompressd = kthread_run(zram_kcompressd,
+						&kcompressd_para[idx], "zram_kcompd:%d", idx);
 				if (IS_ERR(kcompress[idx].kcompressd)) {
 					atomic_set(&kcompress[idx].running, KCOMPRESSD_NOT_STARTED);
 					pr_warn("Failed to start kcompressd:%d\n", idx);

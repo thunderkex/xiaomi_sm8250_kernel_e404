@@ -51,11 +51,28 @@ static int ax_kswapd_cpu_online(unsigned int cpu)
 	if (cpumask_empty(&mask))
 		return 0;
 
+	/*
+	 * pgdat->kswapd is a plain (non-__rcu) pointer, but every task_struct
+	 * is itself freed via call_rcu() at the end of its life regardless of
+	 * how a pointer to it is stored; taking a reference to the task while
+	 * still inside rcu_read_lock() is what keeps get_task_struct() from
+	 * touching already-freed memory if kswapd_stop() races with us here
+	 * (this mirrors how pid_task()/for_each_process() readers work).
+	 */
 	for_each_online_node(nid) {
 		struct pglist_data *pgdat = NODE_DATA(nid);
+		struct task_struct *k;
 
-		if (pgdat && pgdat->kswapd)
-			set_cpus_allowed_ptr(pgdat->kswapd, &mask);
+		rcu_read_lock();
+		k = pgdat ? READ_ONCE(pgdat->kswapd) : NULL;
+		if (k)
+			get_task_struct(k);
+		rcu_read_unlock();
+
+		if (k) {
+			set_cpus_allowed_ptr(k, &mask);
+			put_task_struct(k);
+		}
 	}
 
 	return 0;
@@ -64,6 +81,66 @@ static int ax_kswapd_cpu_online(unsigned int cpu)
 static struct ax_boost_entry boost_table[AX_MAX_BOOST_ENTRIES];
 static unsigned long total_boost_count;
 static DEFINE_MUTEX(boost_table_mutex);
+
+static void ax_boost_reap_fn(struct work_struct *work);
+static DECLARE_DELAYED_WORK(ax_boost_work, ax_boost_reap_fn);
+
+static inline void ax_boost_lease_kick(void)
+{
+	schedule_delayed_work(&ax_boost_work, msecs_to_jiffies(1000));
+}
+
+/* Caller holds boost_table_mutex. Restores nice only if still ours to undo. */
+static void ax_boost_release_locked(struct ax_boost_entry *e)
+{
+	struct task_struct *task;
+
+	rcu_read_lock();
+	task = pid_task(e->spid, PIDTYPE_PID);
+	if (task)
+		get_task_struct(task);
+	rcu_read_unlock();
+
+	if (task) {
+		if (task_nice(task) == e->applied_nice)
+			set_user_nice(task, e->saved_nice);
+		put_task_struct(task);
+	}
+
+	put_pid(e->spid);
+	e->spid = NULL;
+	e->pid = 0;
+	e->active = false;
+}
+
+static void ax_boost_reap_fn(struct work_struct *work)
+{
+	unsigned long now = jiffies;
+	bool more = false;
+	int i;
+
+	mutex_lock(&boost_table_mutex);
+	for (i = 0; i < AX_MAX_BOOST_ENTRIES; i++) {
+		struct ax_boost_entry *e = &boost_table[i];
+		bool alive;
+
+		if (!e->active)
+			continue;
+
+		rcu_read_lock();
+		alive = pid_task(e->spid, PIDTYPE_PID) != NULL;
+		rcu_read_unlock();
+
+		if (!alive || time_after_eq(now, e->expires))
+			ax_boost_release_locked(e);
+		else
+			more = true;
+	}
+	mutex_unlock(&boost_table_mutex);
+
+	if (more)
+		ax_boost_lease_kick();
+}
 
 /* CPUMask parser supporting hex ("0f", "0x0f") and cpulist ("0-3", "0,1,2") */
 int ax_parse_cpumask(const char *buf, cpumask_t *mask)
@@ -136,11 +213,17 @@ static ssize_t kswapd_pin_write(struct file *file, const char __user *ubuf,
 	/* 1. Pin NUMA node kswapd tasks directly via pgdat */
 	for_each_online_node(nid) {
 		struct pglist_data *pgdat = NODE_DATA(nid);
+		struct task_struct *k;
 
-		if (pgdat && pgdat->kswapd) {
-			get_task_struct(pgdat->kswapd);
-			set_cpus_allowed_ptr(pgdat->kswapd, &new_mask);
-			put_task_struct(pgdat->kswapd);
+		rcu_read_lock();
+		k = pgdat ? READ_ONCE(pgdat->kswapd) : NULL;
+		if (k)
+			get_task_struct(k);
+		rcu_read_unlock();
+
+		if (k) {
+			set_cpus_allowed_ptr(k, &new_mask);
+			put_task_struct(k);
 		}
 	}
 
@@ -260,24 +343,7 @@ static ssize_t boost_write(struct file *file, const char __user *ubuf,
 			return -ENOENT;
 		}
 
-		rcu_read_lock();
-		task = pid_task(boost_table[target_slot].spid, PIDTYPE_PID);
-		if (task)
-			get_task_struct(task);
-		rcu_read_unlock();
-
-		if (task) {
-			struct ax_boost_entry *e = &boost_table[target_slot];
-
-			if (task_nice(task) == e->applied_nice)
-				set_user_nice(task, e->saved_nice);
-			put_task_struct(task);
-		}
-
-		put_pid(boost_table[target_slot].spid);
-		boost_table[target_slot].spid = NULL;
-		boost_table[target_slot].pid = 0;
-		boost_table[target_slot].active = false;
+		ax_boost_release_locked(&boost_table[target_slot]);
 		mutex_unlock(&boost_table_mutex);
 		return count;
 	}
@@ -308,13 +374,19 @@ static ssize_t boost_write(struct file *file, const char __user *ubuf,
 	mutex_lock(&boost_table_mutex);
 	for (i = 0; i < AX_MAX_BOOST_ENTRIES; i++) {
 		struct ax_boost_entry *e = &boost_table[i];
+		bool alive;
 
 		/* Garbage collect slots whose task exited without release */
-		if (e->active && !pid_task(e->spid, PIDTYPE_PID)) {
-			put_pid(e->spid);
-			e->spid = NULL;
-			e->pid = 0;
-			e->active = false;
+		if (e->active) {
+			rcu_read_lock();
+			alive = pid_task(e->spid, PIDTYPE_PID) != NULL;
+			rcu_read_unlock();
+			if (!alive) {
+				put_pid(e->spid);
+				e->spid = NULL;
+				e->pid = 0;
+				e->active = false;
+			}
 		}
 
 		if (e->active && e->spid == spid) {
@@ -344,12 +416,24 @@ static ssize_t boost_write(struct file *file, const char __user *ubuf,
 
 	boost_table[target_slot].applied_nice = target_nice;
 	boost_table[target_slot].level = boost_level;
+	boost_table[target_slot].expires = jiffies +
+					    msecs_to_jiffies(AX_BOOST_LEASE_TTL_MS);
 	total_boost_count++;
+
+	/*
+	 * set_user_nice() stays inside the mutex: dropping it first lets a
+	 * concurrent release() for this same pid run first, see the old
+	 * (pre-boost) nice value, and clear this entry — after which
+	 * set_user_nice() below would still apply -20/-5 with no entry left
+	 * to ever undo it. set_user_nice() already requeues the task, so no
+	 * wake_up_process() is needed (it only risks a spurious wakeup for a
+	 * task currently in interruptible sleep).
+	 */
+	set_user_nice(task, target_nice);
 	mutex_unlock(&boost_table_mutex);
 
-	set_user_nice(task, target_nice);
-	wake_up_process(task);
 	put_task_struct(task);
+	ax_boost_lease_kick();
 
 	return count;
 }
@@ -357,26 +441,34 @@ static ssize_t boost_write(struct file *file, const char __user *ubuf,
 static int boost_show(struct seq_file *m, void *v)
 {
 	int i, active_count = 0;
-	unsigned long total;
+	unsigned long total, now = jiffies;
 
 	mutex_lock(&boost_table_mutex);
 	total = total_boost_count;
-	seq_printf(m, "# pid saved_nice level\n");
+	seq_printf(m, "# pid saved_nice level ttl_ms\n");
 	for (i = 0; i < AX_MAX_BOOST_ENTRIES; i++) {
 		struct ax_boost_entry *e = &boost_table[i];
+		bool alive;
 
-		if (e->active) {
-			if (!pid_task(e->spid, PIDTYPE_PID)) {
-				put_pid(e->spid);
-				e->spid = NULL;
-				e->pid = 0;
-				e->active = false;
-				continue;
-			}
-			seq_printf(m, "%-8d %-10d %-5d\n",
-				   e->pid, e->saved_nice, e->level);
-			active_count++;
+		if (!e->active)
+			continue;
+
+		rcu_read_lock();
+		alive = pid_task(e->spid, PIDTYPE_PID) != NULL;
+		rcu_read_unlock();
+
+		if (!alive) {
+			put_pid(e->spid);
+			e->spid = NULL;
+			e->pid = 0;
+			e->active = false;
+			continue;
 		}
+		seq_printf(m, "%-8d %-10d %-5d %u\n",
+			   e->pid, e->saved_nice, e->level,
+			   time_after(e->expires, now) ?
+			   jiffies_to_msecs(e->expires - now) : 0);
+		active_count++;
 	}
 	mutex_unlock(&boost_table_mutex);
 
@@ -669,6 +761,7 @@ static void __exit ax_dragonite_core_exit(void)
 	mutex_unlock(&boost_table_mutex);
 
 	cancel_delayed_work_sync(&ax_swappiness_work);
+	cancel_delayed_work_sync(&ax_boost_work);
 
 	if (ax_dragonite_dir) {
 		remove_proc_entry("version", ax_dragonite_dir);

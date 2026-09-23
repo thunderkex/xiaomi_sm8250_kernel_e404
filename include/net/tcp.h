@@ -366,9 +366,6 @@ extern int tcp_proc_delayed_ack_control(struct ctl_table *table, int write,
 				loff_t *ppos);
 
 void tcp_enter_quickack_mode(struct sock *sk, unsigned int max_quickacks);
-static inline void tcp_dec_quickack_mode(struct sock *sk,
-					 const unsigned int pkts)
-
 static inline void tcp_dec_quickack_mode(struct sock *sk)
 {
 	struct inet_connection_sock *icsk = inet_csk(sk);
@@ -817,7 +814,7 @@ static inline u32 tcp_skb_timestamp(const struct sk_buff *skb)
 /* provide the departure time in us unit */
 static inline u64 tcp_skb_timestamp_us(const struct sk_buff *skb)
 {
-	return skb->skb_mstamp;
+	return skb->skb_mstamp_ns;
 }
 
 

@@ -22,13 +22,14 @@
 #include <linux/string.h>
 #include <linux/ctype.h>
 #include <linux/ratelimit.h>
+#include <linux/atomic.h>
 
 #include "ax_dragonite.h"
 
 struct named_affinity_rule {
 	char comm[TASK_COMM_LEN];
 	cpumask_t mask;
-	unsigned long applied_count;
+	atomic_long_t applied_count;
 	bool active;
 };
 
@@ -98,7 +99,7 @@ void ax_named_thread_affinity_apply(struct task_struct *p)
 				rcu_read_unlock();
 				return;
 			}
-			affinity_rules[i].applied_count++;
+			atomic_long_inc(&affinity_rules[i].applied_count);
 			rcu_read_unlock();
 			set_cpus_allowed_ptr(p, &mask);
 			return;
@@ -196,13 +197,25 @@ static ssize_t rules_write(struct file *file, const char __user *ubuf,
 			free_slot = i;
 	}
 
-	if (target_slot == -1)
+	if (target_slot == -1) {
 		target_slot = free_slot;
+	} else {
+		/*
+		 * Editing an already-active slot: unpublish and wait out
+		 * existing readers before mutating comm/mask. Without this,
+		 * ax_named_thread_affinity_apply() (which only holds
+		 * rcu_read_lock(), not affinity_mutex) can observe a comm
+		 * string or cpumask that is half old, half new.
+		 */
+		smp_store_release(&affinity_rules[target_slot].active, false);
+		synchronize_rcu();
+	}
 
 	if (target_slot != -1) {
 		strlcpy(affinity_rules[target_slot].comm, target_comm,
 			TASK_COMM_LEN);
 		cpumask_copy(&affinity_rules[target_slot].mask, &mask);
+		atomic_long_set(&affinity_rules[target_slot].applied_count, 0);
 		smp_store_release(&affinity_rules[target_slot].active, true);
 	}
 	mutex_unlock(&affinity_mutex);
@@ -219,7 +232,7 @@ static ssize_t rules_write(struct file *file, const char __user *ubuf,
 		if (affinity_rules[target_slot].active &&
 		    strncmp(affinity_rules[target_slot].comm, target_comm,
 			    TASK_COMM_LEN) == 0)
-			affinity_rules[target_slot].applied_count += applied;
+			atomic_long_add(applied, &affinity_rules[target_slot].applied_count);
 		mutex_unlock(&affinity_mutex);
 	}
 
@@ -236,10 +249,10 @@ static int rules_show(struct seq_file *m, void *v)
 	for (i = 0; i < AX_MAX_AFFINITY_RULES; i++) {
 		if (affinity_rules[i].active) {
 			cpumap_print_to_pagebuf(false, mask_str, &affinity_rules[i].mask);
-			seq_printf(m, "%-16s %s %lu\n",
+			seq_printf(m, "%-16s %s %ld\n",
 				   affinity_rules[i].comm,
 				   strim(mask_str),
-				   affinity_rules[i].applied_count);
+				   atomic_long_read(&affinity_rules[i].applied_count));
 		}
 	}
 	mutex_unlock(&affinity_mutex);
