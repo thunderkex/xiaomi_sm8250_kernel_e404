@@ -1637,7 +1637,7 @@ struct ncm_setup_desc {
 static struct ncm_setup_desc *_ncm_setup_desc;
 
 #define MIRROR_LINK_STRING_LENGTH_MAX 32
-static void ncm_setup_work(struct work_struct *data)
+static void __maybe_unused ncm_setup_work(struct work_struct *data)
 {
 	char mirror_link_string[MIRROR_LINK_STRING_LENGTH_MAX];
 	char *envp[2] = { mirror_link_string, NULL };
