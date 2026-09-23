@@ -1510,14 +1510,8 @@ int cdc_ncm_rx_fixup(struct usbnet *dev, struct sk_buff *skb_in)
 	int nframes;
 	int x;
 	unsigned int offset;
-	union {
-		struct usb_cdc_ncm_ndp16 *ndp16;
-		struct usb_cdc_ncm_ndp32 *ndp32;
-	} ndp;
-	union {
-		struct usb_cdc_ncm_dpe16 *dpe16;
-		struct usb_cdc_ncm_dpe32 *dpe32;
-	} dpe;
+	struct usb_cdc_ncm_ndp16 *ndp16;
+	struct usb_cdc_ncm_dpe16 *dpe16;
 
 	int ndpoffset;
 	int loopcount = 50; /* arbitrary max preventing infinite loop */
