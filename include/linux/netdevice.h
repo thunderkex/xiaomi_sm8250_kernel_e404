@@ -2496,6 +2496,18 @@ struct pcpu_lstats {
 	struct u64_stats_sync syncp;
 };
 
+void dev_lstats_read(struct net_device *dev, u64 *packets, u64 *bytes);
+
+static inline void dev_lstats_add(struct net_device *dev, unsigned int len)
+{
+	struct pcpu_lstats *nlstats = this_cpu_ptr(dev->lstats);
+
+	u64_stats_update_begin(&nlstats->syncp);
+	nlstats->bytes += len;
+	nlstats->packets++;
+	u64_stats_update_end(&nlstats->syncp);
+}
+
 #define __netdev_alloc_pcpu_stats(type, gfp)				\
 ({									\
 	typeof(type) __percpu *pcpu_stats = alloc_percpu_gfp(type, gfp);\

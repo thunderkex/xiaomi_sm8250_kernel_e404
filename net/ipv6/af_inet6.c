@@ -441,6 +441,7 @@ int inet6_bind(struct socket *sock, struct sockaddr *uaddr, int addr_len)
 {
 	struct sock *sk = sock->sk;
 	const struct proto *prot;
+	u32 flags = BIND_WITH_LOCK;
 	int err = 0;
 
 	/* IPV6_ADDRFORM can change sk->sk_prot under us. */
