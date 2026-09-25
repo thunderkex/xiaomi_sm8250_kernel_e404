@@ -4,7 +4,8 @@
  *
  * Exposes:
  *  - /proc/ax_dragonite/kswapd_pin: pins kswapd threads across NUMA nodes
- *  - /proc/ax_dragonite/boost: elevates priority of designated task (CFS/PELT)
+ *  - /proc/ax_dragonite/boost: elevates priority of designated task (CFS/PELT + WALT)
+ *  - /proc/sys/walt/nt_sched_per_task_boost: WALT per-task boost compat shim
  */
 
 #include <linux/module.h>
@@ -28,8 +29,38 @@
 #include <linux/jiffies.h>
 #include <linux/workqueue.h>
 #include <linux/utsname.h>
+#include <linux/sysctl.h>
+#include <linux/sched/clock.h>
 
 #include "ax_dragonite.h"
+
+/*
+ * WALT per-task boost levels (mirrors kernel/sched/fair.c enum):
+ *   TASK_BOOST_NONE        = 0
+ *   TASK_BOOST_ON_MID      = 1  (Light: prefer mid/big cores)
+ *   TASK_BOOST_ON_MAX      = 2  (Heavy: prefer big cores)
+ *   TASK_BOOST_STRICT_MAX  = 3  (Heavy: force prime core)
+ *
+ * ax_dragonite boost level mapping:
+ *   level 1 (Light)  -> TASK_BOOST_ON_MID      (1)
+ *   level 2 (Heavy)  -> TASK_BOOST_STRICT_MAX   (3)
+ */
+#define AX_WALT_BOOST_LIGHT  1
+#define AX_WALT_BOOST_HEAVY  3
+
+static inline void ax_apply_walt_boost(struct task_struct *task, int level)
+{
+	task->boost = (level == 2) ? AX_WALT_BOOST_HEAVY : AX_WALT_BOOST_LIGHT;
+	task->boost_period = 0;   /* persistent until explicit release */
+	task->boost_expires = 0;
+}
+
+static inline void ax_clear_walt_boost(struct task_struct *task)
+{
+	task->boost = 0;
+	task->boost_period = 0;
+	task->boost_expires = 0;
+}
 
 struct proc_dir_entry *ax_dragonite_dir;
 EXPORT_SYMBOL_GPL(ax_dragonite_dir);
@@ -271,6 +302,7 @@ static ssize_t boost_write(struct file *file, const char __user *ubuf,
 
 			if (task_nice(task) == e->applied_nice)
 				set_user_nice(task, e->saved_nice);
+			ax_clear_walt_boost(task);
 			put_task_struct(task);
 		}
 
@@ -348,6 +380,7 @@ static ssize_t boost_write(struct file *file, const char __user *ubuf,
 	mutex_unlock(&boost_table_mutex);
 
 	set_user_nice(task, target_nice);
+	ax_apply_walt_boost(task, boost_level);
 	wake_up_process(task);
 	put_task_struct(task);
 
@@ -518,6 +551,123 @@ static int version_open(struct inode *inode, struct file *file)
 }
 
 /* -------------------------------------------------------------------------
+ * /proc/sys/walt/nt_sched_per_task_boost  (compat shim)
+ *
+ * Write: "<pid> <boost_level> [<period_ms>]"
+ *   boost_level: 0 = release, 1 = light (TASK_BOOST_ON_MID),
+ *                2 = heavy (TASK_BOOST_STRICT_MAX)
+ *   period_ms:   0 or omitted = persistent
+ *
+ * This mirrors the NothingOS nt_sched_per_task_boost sysctl so the AxDragonite
+ * Java server can find this path without modification.
+ * -------------------------------------------------------------------------*/
+static int ax_walt_compat_boost_handler(struct ctl_table *table, int write,
+					void __user *buffer, size_t *lenp,
+					loff_t *ppos)
+{
+	char kbuf[48];
+	char *ptr, *tok;
+	int pid, boost_state = 1, boost_level = 1;
+	long period_ms = 0;
+	struct pid *spid;
+	struct task_struct *task;
+	size_t len;
+
+	if (!write) {
+		return proc_dointvec(table, write, buffer, lenp, ppos);
+	}
+
+	if (!ax_dragonite_is_authorized())
+		return -EPERM;
+
+	len = min(*lenp, sizeof(kbuf) - 1);
+	if (copy_from_user(kbuf, buffer, len))
+		return -EFAULT;
+	kbuf[len] = '\0';
+	ptr = strim(kbuf);
+
+	tok = strsep(&ptr, " \t");
+	if (!tok || kstrtoint(tok, 10, &pid) < 0 || pid <= 0)
+		return -EINVAL;
+
+	if (ptr) {
+		ptr = skip_spaces(ptr);
+		tok = strsep(&ptr, " \t");
+		if (tok && *tok && kstrtoint(tok, 10, &boost_state) < 0)
+			return -EINVAL;
+	}
+
+	if (ptr) {
+		ptr = skip_spaces(ptr);
+		tok = strsep(&ptr, " \t");
+		if (tok && *tok && kstrtol(tok, 10, &period_ms) < 0)
+			return -EINVAL;
+	}
+
+	boost_level = (boost_state == 0) ? 0 : ((boost_state >= 2) ? 2 : 1);
+
+	spid = find_get_pid(pid);
+	if (!spid)
+		return -ESRCH;
+
+	rcu_read_lock();
+	task = pid_task(spid, PIDTYPE_PID);
+	if (task)
+		get_task_struct(task);
+	rcu_read_unlock();
+
+	if (!task) {
+		put_pid(spid);
+		return -ESRCH;
+	}
+
+	if (boost_level == 0) {
+		ax_clear_walt_boost(task);
+		set_user_nice(task, 0);
+	} else {
+		task->boost = (boost_level == 2) ? AX_WALT_BOOST_HEAVY
+						 : AX_WALT_BOOST_LIGHT;
+		if (period_ms > 0) {
+			task->boost_period = (u64)period_ms * NSEC_PER_MSEC;
+			task->boost_expires = sched_clock() + task->boost_period;
+		} else {
+			task->boost_period = 0;
+			task->boost_expires = 0;
+		}
+		set_user_nice(task, (boost_level == 2) ? -20 : -5);
+	}
+
+	put_task_struct(task);
+	put_pid(spid);
+	*lenp = len;
+	return 0;
+}
+
+static int ax_walt_compat_dummy;
+
+static struct ctl_table ax_walt_compat_table[] = {
+	{
+		.procname	= "nt_sched_per_task_boost",
+		.data		= &ax_walt_compat_dummy,
+		.maxlen		= sizeof(int),
+		.mode		= 0640,
+		.proc_handler	= ax_walt_compat_boost_handler,
+	},
+	{}
+};
+
+static struct ctl_table ax_walt_compat_root[] = {
+	{
+		.procname	= "walt",
+		.mode		= 0555,
+		.child		= ax_walt_compat_table,
+	},
+	{}
+};
+
+static struct ctl_table_header *ax_walt_sysctl_header;
+
+/* -------------------------------------------------------------------------
  * Procfs Ops definition (Linux 4.19 and 5.6+ compatible)
  * ------------------------------------------------------------------------- */
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 6, 0)
@@ -604,16 +754,16 @@ static int __init ax_dragonite_core_init(void)
 		return -ENOMEM;
 	}
 
-	entry = proc_create("kswapd_pin", 0640, ax_dragonite_dir,
+	entry = proc_create("kswapd_pin", 0660, ax_dragonite_dir,
 			    &kswapd_pin_ops);
 	if (!entry)
 		goto err_kswapd_pin;
 
-	entry = proc_create("boost", 0640, ax_dragonite_dir, &boost_ops);
+	entry = proc_create("boost", 0660, ax_dragonite_dir, &boost_ops);
 	if (!entry)
 		goto err_boost;
 
-	entry = proc_create("swappiness_override", 0640, ax_dragonite_dir,
+	entry = proc_create("swappiness_override", 0660, ax_dragonite_dir,
 			    &swappiness_override_ops);
 	if (!entry)
 		goto err_swappiness;
@@ -631,6 +781,12 @@ static int __init ax_dragonite_core_init(void)
 					ax_kswapd_cpu_online, NULL);
 	if (ret > 0)
 		ax_kswapd_hp_state = ret;
+
+	/* Register /proc/sys/walt/nt_sched_per_task_boost compat shim */
+	ax_walt_sysctl_header = register_sysctl_table(ax_walt_compat_root);
+	if (!ax_walt_sysctl_header)
+		pr_warn(AX_DRAGONITE_TAG
+			"failed to register walt sysctl shim (non-fatal)\n");
 
 	pr_info(AX_DRAGONITE_TAG "driver initialized successfully\n");
 	return 0;
@@ -653,6 +809,9 @@ static void __exit ax_dragonite_core_exit(void)
 {
 	int i;
 
+	if (ax_walt_sysctl_header)
+		unregister_sysctl_table(ax_walt_sysctl_header);
+
 	if (ax_kswapd_hp_state)
 		cpuhp_remove_state_nocalls(ax_kswapd_hp_state);
 
@@ -661,6 +820,18 @@ static void __exit ax_dragonite_core_exit(void)
 	mutex_lock(&boost_table_mutex);
 	for (i = 0; i < AX_MAX_BOOST_ENTRIES; i++) {
 		if (boost_table[i].active && boost_table[i].spid) {
+			struct task_struct *task;
+
+			rcu_read_lock();
+			task = pid_task(boost_table[i].spid, PIDTYPE_PID);
+			if (task)
+				get_task_struct(task);
+			rcu_read_unlock();
+			if (task) {
+				set_user_nice(task, boost_table[i].saved_nice);
+				ax_clear_walt_boost(task);
+				put_task_struct(task);
+			}
 			put_pid(boost_table[i].spid);
 			boost_table[i].spid = NULL;
 			boost_table[i].active = false;
