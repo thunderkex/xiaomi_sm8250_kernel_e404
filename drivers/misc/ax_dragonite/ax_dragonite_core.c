@@ -198,11 +198,12 @@ static ssize_t boost_write(struct file *file, const char __user *ubuf,
 			   size_t count, loff_t *ppos)
 {
 	char kbuf[48];
-	char *ptr, *pid_str, *state_str, *level_str;
-	int pid, boost_state = 1, boost_level = 2; /* default: acquire, heavy (nice -20) */
+	char *ptr, *tok;
+	int pid, boost_state = 1, boost_level = 2;
+	struct pid *spid;
 	struct task_struct *task;
-	int i, target_slot = -1, orig_nice = 0;
 	size_t len = min(count, sizeof(kbuf) - 1);
+	int i, target_slot = -1, free_slot = -1, target_nice;
 
 	if (!ax_dragonite_is_authorized()) {
 		pr_warn_ratelimited(AX_DRAGONITE_TAG
@@ -216,71 +217,33 @@ static ssize_t boost_write(struct file *file, const char __user *ubuf,
 	kbuf[len] = '\0';
 	ptr = strim(kbuf);
 
-	/* Accept "<pid> [state] [level]" (e.g. "1819", "1819 1", "1819 1 1", "1819 0") */
-	pid_str = strsep(&ptr, " \t");
-	if (!pid_str || kstrtoint(pid_str, 10, &pid) < 0 || pid <= 0) {
+	tok = strsep(&ptr, " \t");
+	if (!tok || kstrtoint(tok, 10, &pid) < 0 || pid <= 0) {
 		pr_warn_ratelimited(AX_DRAGONITE_TAG "invalid boost pid: %s\n", kbuf);
 		return -EINVAL;
 	}
 
 	if (ptr) {
 		ptr = skip_spaces(ptr);
-		state_str = strsep(&ptr, " \t");
-		if (state_str && kstrtoint(state_str, 10, &boost_state) < 0)
-			boost_state = 1;
+		tok = strsep(&ptr, " \t");
+		if (tok && *tok && kstrtoint(tok, 10, &boost_state) < 0)
+			return -EINVAL;
 	}
 
 	if (ptr) {
 		ptr = skip_spaces(ptr);
-		level_str = strsep(&ptr, " \t");
-		if (level_str && kstrtoint(level_str, 10, &boost_level) < 0)
-			boost_level = 2;
+		tok = strsep(&ptr, " \t");
+		if (tok && *tok && kstrtoint(tok, 10, &boost_level) < 0)
+			return -EINVAL;
 	}
 
-	if (boost_state > 0) {
-		/* Boost Acquire: Level 1 = Light (-5), Level 2 = Heavy (-20) */
-		int target_nice = (boost_level == 1) ? -5 : -20;
-		int free_slot = -1;
+	if (boost_level != 1 && boost_level != 2) {
+		pr_warn_ratelimited(AX_DRAGONITE_TAG "invalid boost level: %d\n",
+				    boost_level);
+		return -EINVAL;
+	}
 
-		rcu_read_lock();
-		task = find_task_by_vpid(pid);
-		if (!task) {
-			rcu_read_unlock();
-			return -ESRCH;
-		}
-		get_task_struct(task);
-		rcu_read_unlock();
-
-		mutex_lock(&boost_table_mutex);
-		for (i = 0; i < AX_MAX_BOOST_ENTRIES; i++) {
-			if (boost_table[i].active && boost_table[i].pid == pid) {
-				target_slot = i;
-				break;
-			}
-			if (!boost_table[i].active && free_slot == -1)
-				free_slot = i;
-		}
-
-		if (target_slot == -1) {
-			if (free_slot == -1) {
-				mutex_unlock(&boost_table_mutex);
-				put_task_struct(task);
-				pr_warn_ratelimited(AX_DRAGONITE_TAG "boost table full\n");
-				return -ENOSPC;
-			}
-			target_slot = free_slot;
-			boost_table[target_slot].pid = pid;
-			boost_table[target_slot].saved_nice = task_nice(task);
-			boost_table[target_slot].active = true;
-		}
-		boost_table[target_slot].level = boost_level;
-		total_boost_count++;
-		mutex_unlock(&boost_table_mutex);
-
-		set_user_nice(task, target_nice);
-		wake_up_process(task);
-		put_task_struct(task);
-	} else {
+	if (boost_state <= 0) {
 		/* Boost Release: restore saved prior nice value */
 		mutex_lock(&boost_table_mutex);
 		for (i = 0; i < AX_MAX_BOOST_ENTRIES; i++) {
@@ -297,22 +260,96 @@ static ssize_t boost_write(struct file *file, const char __user *ubuf,
 			return -ENOENT;
 		}
 
-		orig_nice = boost_table[target_slot].saved_nice;
-		boost_table[target_slot].active = false;
-		boost_table[target_slot].pid = 0;
-		mutex_unlock(&boost_table_mutex);
-
 		rcu_read_lock();
-		task = find_task_by_vpid(pid);
-		if (task) {
+		task = pid_task(boost_table[target_slot].spid, PIDTYPE_PID);
+		if (task)
 			get_task_struct(task);
-			rcu_read_unlock();
-			set_user_nice(task, orig_nice);
+		rcu_read_unlock();
+
+		if (task) {
+			struct ax_boost_entry *e = &boost_table[target_slot];
+
+			if (task_nice(task) == e->applied_nice)
+				set_user_nice(task, e->saved_nice);
 			put_task_struct(task);
-		} else {
-			rcu_read_unlock();
 		}
+
+		put_pid(boost_table[target_slot].spid);
+		boost_table[target_slot].spid = NULL;
+		boost_table[target_slot].pid = 0;
+		boost_table[target_slot].active = false;
+		mutex_unlock(&boost_table_mutex);
+		return count;
 	}
+
+	/* Boost Acquire: Level 1 = Light (-5), Level 2 = Heavy (-20) */
+	target_nice = (boost_level == 1) ? -5 : -20;
+
+	spid = find_get_pid(pid);
+	if (!spid)
+		return -ESRCH;
+
+	rcu_read_lock();
+	task = pid_task(spid, PIDTYPE_PID);
+	if (task)
+		get_task_struct(task);
+	rcu_read_unlock();
+	if (!task) {
+		put_pid(spid);
+		return -ESRCH;
+	}
+
+	if (task->flags & PF_KTHREAD) {
+		put_task_struct(task);
+		put_pid(spid);
+		return -EPERM;
+	}
+
+	mutex_lock(&boost_table_mutex);
+	for (i = 0; i < AX_MAX_BOOST_ENTRIES; i++) {
+		struct ax_boost_entry *e = &boost_table[i];
+
+		/* Garbage collect slots whose task exited without release */
+		if (e->active && !pid_task(e->spid, PIDTYPE_PID)) {
+			put_pid(e->spid);
+			e->spid = NULL;
+			e->pid = 0;
+			e->active = false;
+		}
+
+		if (e->active && e->spid == spid) {
+			target_slot = i;
+			break;
+		}
+		if (!e->active && free_slot == -1)
+			free_slot = i;
+	}
+
+	if (target_slot == -1) {
+		if (free_slot == -1) {
+			mutex_unlock(&boost_table_mutex);
+			put_task_struct(task);
+			put_pid(spid);
+			pr_warn_ratelimited(AX_DRAGONITE_TAG "boost table full\n");
+			return -ENOSPC;
+		}
+		target_slot = free_slot;
+		boost_table[target_slot].spid = spid;
+		boost_table[target_slot].pid = pid;
+		boost_table[target_slot].saved_nice = task_nice(task);
+		boost_table[target_slot].active = true;
+	} else {
+		put_pid(spid);
+	}
+
+	boost_table[target_slot].applied_nice = target_nice;
+	boost_table[target_slot].level = boost_level;
+	total_boost_count++;
+	mutex_unlock(&boost_table_mutex);
+
+	set_user_nice(task, target_nice);
+	wake_up_process(task);
+	put_task_struct(task);
 
 	return count;
 }
@@ -326,11 +363,18 @@ static int boost_show(struct seq_file *m, void *v)
 	total = total_boost_count;
 	seq_printf(m, "# pid saved_nice level\n");
 	for (i = 0; i < AX_MAX_BOOST_ENTRIES; i++) {
-		if (boost_table[i].active) {
+		struct ax_boost_entry *e = &boost_table[i];
+
+		if (e->active) {
+			if (!pid_task(e->spid, PIDTYPE_PID)) {
+				put_pid(e->spid);
+				e->spid = NULL;
+				e->pid = 0;
+				e->active = false;
+				continue;
+			}
 			seq_printf(m, "%-8d %-10d %-5d\n",
-				   boost_table[i].pid,
-				   boost_table[i].saved_nice,
-				   boost_table[i].level);
+				   e->pid, e->saved_nice, e->level);
 			active_count++;
 		}
 	}
@@ -348,10 +392,33 @@ static int boost_open(struct inode *inode, struct file *file)
 /* -------------------------------------------------------------------------
  * /proc/ax_dragonite/swappiness_override
  * ------------------------------------------------------------------------- */
+#define AX_SWAPPINESS_LEASE_TTL_MS 15000
+
 static int saved_vm_swappiness;
+static int applied_vm_swappiness;
 static unsigned int swappiness_lease_count;
 static bool swappiness_override_active;
+static unsigned long swappiness_expires;
 static DEFINE_SPINLOCK(swappiness_override_lock);
+
+static void ax_swappiness_reap_fn(struct work_struct *work);
+static DECLARE_DELAYED_WORK(ax_swappiness_work, ax_swappiness_reap_fn);
+
+static void ax_swappiness_reap_fn(struct work_struct *work)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&swappiness_override_lock, flags);
+	if (swappiness_override_active &&
+	    time_after_eq(jiffies, swappiness_expires)) {
+		/* Only restore if userspace sysctl has not overwritten it */
+		if (vm_swappiness == applied_vm_swappiness)
+			vm_swappiness = saved_vm_swappiness;
+		swappiness_override_active = false;
+		swappiness_lease_count = 0;
+	}
+	spin_unlock_irqrestore(&swappiness_override_lock, flags);
+}
 
 static ssize_t swappiness_override_write(struct file *file, const char __user *ubuf,
 					 size_t count, loff_t *ppos)
@@ -383,8 +450,10 @@ static ssize_t swappiness_override_write(struct file *file, const char __user *u
 		if (swappiness_lease_count > 0) {
 			swappiness_lease_count--;
 			if (swappiness_lease_count == 0 && swappiness_override_active) {
-				vm_swappiness = saved_vm_swappiness;
+				if (vm_swappiness == applied_vm_swappiness)
+					vm_swappiness = saved_vm_swappiness;
 				swappiness_override_active = false;
+				cancel_delayed_work(&ax_swappiness_work);
 			}
 		}
 	} else if (target_val <= 200) {
@@ -393,11 +462,16 @@ static ssize_t swappiness_override_write(struct file *file, const char __user *u
 			saved_vm_swappiness = vm_swappiness;
 			swappiness_override_active = true;
 		}
+		applied_vm_swappiness = target_val;
 		vm_swappiness = target_val;
 		swappiness_lease_count++;
+		ttl = msecs_to_jiffies(AX_SWAPPINESS_LEASE_TTL_MS);
+		swappiness_expires = jiffies + ttl;
+		mod_delayed_work(system_wq, &ax_swappiness_work, ttl);
 	} else {
 		spin_unlock_irqrestore(&swappiness_override_lock, flags);
-		pr_warn_ratelimited(AX_DRAGONITE_TAG "swappiness out of range (0-200): %d\n", target_val);
+		pr_warn_ratelimited(AX_DRAGONITE_TAG "swappiness out of range (0-200): %d\n",
+				    target_val);
 		return -EINVAL;
 	}
 	spin_unlock_irqrestore(&swappiness_override_lock, flags);
@@ -434,7 +508,7 @@ static int swappiness_override_open(struct inode *inode, struct file *file)
  * ------------------------------------------------------------------------- */
 static int version_show(struct seq_file *m, void *v)
 {
-	seq_printf(m, "AxDragonite 4.19.404R-dragonite\n");
+	seq_printf(m, "AxDragonite %s\n", init_utsname()->release);
 	return 0;
 }
 
@@ -577,6 +651,11 @@ err_kswapd_pin:
 
 static void __exit ax_dragonite_core_exit(void)
 {
+	int i;
+
+	if (ax_kswapd_hp_state)
+		cpuhp_remove_state_nocalls(ax_kswapd_hp_state);
+
 	ax_named_thread_affinity_exit();
 
 	mutex_lock(&boost_table_mutex);
