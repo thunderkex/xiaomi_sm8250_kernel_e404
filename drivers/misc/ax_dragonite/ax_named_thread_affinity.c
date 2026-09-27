@@ -42,6 +42,7 @@ static struct named_affinity_rule affinity_rules[AX_MAX_AFFINITY_RULES];
 static DEFINE_MUTEX(affinity_mutex);
 
 #define AX_AFFINITY_BATCH_SIZE 32
+#define AX_AFFINITY_MAX_ITERS 64
 
 /* Apply mask to all currently existing threads matching comm */
 static unsigned long apply_named_affinity_to_tasks(const char *comm,
@@ -50,13 +51,17 @@ static unsigned long apply_named_affinity_to_tasks(const char *comm,
 	struct task_struct *g, *t;
 	struct task_struct *batch[AX_AFFINITY_BATCH_SIZE];
 	int count, i;
+	int iters = 0;
 	unsigned long total_applied = 0;
 
 	do {
 		count = 0;
 		rcu_read_lock();
 		for_each_process_thread(g, t) {
-			if (strncmp(t->comm, comm, TASK_COMM_LEN) == 0 &&
+			char comm_buf[TASK_COMM_LEN];
+
+			get_task_comm(comm_buf, t);
+			if (strncmp(comm_buf, comm, TASK_COMM_LEN) == 0 &&
 			    !cpumask_equal(&t->cpus_allowed, mask)) {
 				get_task_struct(t);
 				batch[count++] = t;
@@ -67,11 +72,17 @@ static unsigned long apply_named_affinity_to_tasks(const char *comm,
 		rcu_read_unlock();
 
 		for (i = 0; i < count; i++) {
-			set_cpus_allowed_ptr(batch[i], mask);
+			int ret = set_cpus_allowed_ptr(batch[i], mask);
+
+			if (ret)
+				pr_warn_ratelimited(AX_DRAGONITE_TAG
+					"affinity apply failed for %s (pid %d): %d\n",
+					comm, batch[i]->pid, ret);
 			put_task_struct(batch[i]);
 		}
 		total_applied += count;
-	} while (count == AX_AFFINITY_BATCH_SIZE);
+	} while (count == AX_AFFINITY_BATCH_SIZE &&
+		 ++iters < AX_AFFINITY_MAX_ITERS);
 
 	return total_applied;
 }
@@ -79,6 +90,7 @@ static unsigned long apply_named_affinity_to_tasks(const char *comm,
 /* Named affinity hook called from wake_up_new_task() post-unlock and PR_SET_NAME */
 void ax_named_thread_affinity_apply(struct task_struct *p)
 {
+	char comm_buf[TASK_COMM_LEN];
 	int i;
 
 	if (!READ_ONCE(ax_named_affinity_enabled))
@@ -87,10 +99,12 @@ void ax_named_thread_affinity_apply(struct task_struct *p)
 	if (!p || (p->flags & PF_KTHREAD))
 		return;
 
+	get_task_comm(comm_buf, p);
+
 	rcu_read_lock();
 	for (i = 0; i < AX_MAX_AFFINITY_RULES; i++) {
 		if (smp_load_acquire(&affinity_rules[i].active) &&
-		    strncmp(p->comm, affinity_rules[i].comm, TASK_COMM_LEN) == 0) {
+		    strncmp(comm_buf, affinity_rules[i].comm, TASK_COMM_LEN) == 0) {
 			cpumask_t mask;
 
 			cpumask_copy(&mask, &affinity_rules[i].mask);

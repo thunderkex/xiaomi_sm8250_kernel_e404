@@ -190,6 +190,11 @@ static ssize_t kswapd_pin_write(struct file *file, const char __user *ubuf,
 				if (n < AX_PIN_MAX_TASKS) {
 					get_task_struct(t);
 					found[n++] = t;
+				} else {
+					pr_warn_ratelimited(AX_DRAGONITE_TAG
+						"kswapd_pin: task limit reached (%d), some tasks truncated\n",
+						AX_PIN_MAX_TASKS);
+					break;
 				}
 			}
 		}
@@ -342,11 +347,19 @@ static ssize_t boost_write(struct file *file, const char __user *ubuf,
 		struct ax_boost_entry *e = &boost_table[i];
 
 		/* Garbage collect slots whose task exited without release */
-		if (e->active && !pid_task(e->spid, PIDTYPE_PID)) {
-			put_pid(e->spid);
-			e->spid = NULL;
-			e->pid = 0;
-			e->active = false;
+		if (e->active) {
+			bool dead;
+
+			rcu_read_lock();
+			dead = !pid_task(e->spid, PIDTYPE_PID);
+			rcu_read_unlock();
+
+			if (dead) {
+				put_pid(e->spid);
+				e->spid = NULL;
+				e->pid = 0;
+				e->active = false;
+			}
 		}
 
 		if (e->active && e->spid == spid) {
@@ -399,7 +412,13 @@ static int boost_show(struct seq_file *m, void *v)
 		struct ax_boost_entry *e = &boost_table[i];
 
 		if (e->active) {
-			if (!pid_task(e->spid, PIDTYPE_PID)) {
+			bool dead;
+
+			rcu_read_lock();
+			dead = !pid_task(e->spid, PIDTYPE_PID);
+			rcu_read_unlock();
+
+			if (dead) {
 				put_pid(e->spid);
 				e->spid = NULL;
 				e->pid = 0;
