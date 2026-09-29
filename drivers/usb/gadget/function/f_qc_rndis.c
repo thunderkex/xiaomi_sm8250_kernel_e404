@@ -1533,24 +1533,5 @@ bool rndis_qc_get_skip_ep_config(void)
 }
 
 DECLARE_USB_FUNCTION_INIT(rndis_bam, qcrndis_alloc_inst, qcrndis_alloc);
-
-static int __init usb_qcrndis_init(void)
-{
-	int ret;
-
-	ret = usb_function_register(&rndis_bamusb_func);
-	if (ret) {
-		pr_err("%s: failed to register diag %d\n", __func__, ret);
-		return ret;
-	}
-	return ret;
-}
-
-static void __exit usb_qcrndis_exit(void)
-{
-	usb_function_unregister(&rndis_bamusb_func);
-}
-
-module_init(usb_qcrndis_init);
-module_exit(usb_qcrndis_exit);
-MODULE_DESCRIPTION("USB RMNET Function Driver");
+MODULE_DESCRIPTION("USB QC RNDIS Function Driver");
+MODULE_LICENSE("GPL v2");
