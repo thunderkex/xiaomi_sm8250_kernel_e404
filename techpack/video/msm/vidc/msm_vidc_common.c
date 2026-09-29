@@ -1444,10 +1444,10 @@ static int msm_vidc_comm_update_ctrl(struct msm_vidc_inst *inst,
 	if (ctrl->type == V4L2_CTRL_TYPE_MENU)
 		is_menu = true;
 
-	/**
-	 * For menu controls the step value is interpreted
-	 * as a menu_skip_mask.
-	 */
+	/* Skip unsupported/empty controls where step is 0 to avoid V4L2 -ERANGE */
+	if (!is_menu && !cap->step_size && cap->min == cap->max)
+		return 0;
+
 	rc = v4l2_ctrl_modify_range(ctrl, cap->min, cap->max,
 			is_menu ? ctrl->menu_skip_mask : cap->step_size,
 			cap->default_value);
