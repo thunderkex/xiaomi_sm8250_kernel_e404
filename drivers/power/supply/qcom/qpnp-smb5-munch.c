@@ -683,7 +683,7 @@ static int smb5_parse_dt_misc(struct smb5 *chip, struct device_node *node)
 	rc = of_property_read_u32(node, "mi,support-second-ffc-term-current-diff",
 			&chg->support_second_ffc_term_current_diff);
 	if (rc < 0)
-		pr_err("read mi,support-second-ffc-term-current-diff failed\n");
+		pr_debug("read mi,support-second-ffc-term-current-diff failed, using default\n");
 
 	chg->ext_fg = of_property_read_bool(node,
 				"qcom,support-ext-fg");
