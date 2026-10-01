@@ -424,16 +424,19 @@ int ax_named_thread_affinity_init(void)
 	entry = proc_create("pid", 0666, ax_named_affinity_dir, &nta_pid_ops);
 	if (!entry)
 		goto err_pid;
+	axd_proc_fixup_owner(entry);
 
 	entry = proc_create("named_thread_affinity", 0222,
 			    ax_named_affinity_dir, &nta_ops);
 	if (!entry)
 		goto err_nta;
+	axd_proc_fixup_owner(entry);
 
 	entry = proc_create("reset", 0222, ax_named_affinity_dir,
 			    &nta_reset_ops);
 	if (!entry)
 		goto err_reset;
+	axd_proc_fixup_owner(entry);
 
 	return 0;
 

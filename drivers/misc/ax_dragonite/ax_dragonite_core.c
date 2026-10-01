@@ -34,6 +34,15 @@
 
 #include "ax_dragonite.h"
 
+/* Set proc node owner to AID_SYSTEM (1000) so system_server can write without
+ * relying on init.rc chown ordering. Only applied to writable nodes. */
+static void axd_proc_fixup_owner(struct proc_dir_entry *entry)
+{
+	if (!entry)
+		return;
+	proc_set_user(entry, KUIDT_INIT(1000), KGIDT_INIT(1000));
+}
+
 /*
  * WALT per-task boost levels (mirrors kernel/sched/fair.c enum):
  *   TASK_BOOST_NONE        = 0
@@ -843,15 +852,18 @@ static int __init ax_dragonite_core_init(void)
 			    &kswapd_pin_ops);
 	if (!entry)
 		goto err_kswapd_pin;
+	axd_proc_fixup_owner(entry);
 
 	entry = proc_create("boost", 0222, ax_dragonite_dir, &boost_ops);
 	if (!entry)
 		goto err_boost;
+	axd_proc_fixup_owner(entry);
 
 	entry = proc_create("swappiness_override", 0660, ax_dragonite_dir,
 			    &swappiness_override_ops);
 	if (!entry)
 		goto err_swappiness;
+	axd_proc_fixup_owner(entry);
 
 	entry = proc_create("stats", 0444, ax_dragonite_dir, &stats_ops);
 	if (!entry)
