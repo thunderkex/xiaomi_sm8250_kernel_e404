@@ -36,7 +36,7 @@
 
 /* Set proc node owner to AID_SYSTEM (1000) so system_server can write without
  * relying on init.rc chown ordering. Only applied to writable nodes. */
-static void axd_proc_fixup_owner(struct proc_dir_entry *entry)
+void axd_proc_fixup_owner(struct proc_dir_entry *entry)
 {
 	if (!entry)
 		return;
