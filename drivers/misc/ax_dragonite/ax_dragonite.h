@@ -31,6 +31,8 @@ struct ax_boost_entry {
 extern struct proc_dir_entry *ax_dragonite_dir;
 extern struct proc_dir_entry *ax_named_affinity_dir;
 extern bool ax_named_affinity_enabled;
+extern unsigned long ax_total_affinity_applies;
+extern unsigned long ax_total_affinity_resets;
 
 /* Permission validator */
 static inline bool ax_dragonite_is_authorized(void)

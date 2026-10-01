@@ -2,9 +2,13 @@
 /*
  * AxDragonite Named Thread Affinity Support
  *
- * Exposes:
- *  - /proc/ax_named_thread_affinity/rules: register affinity rules (<comm> <mask>)
- *  - /proc/ax_named_thread_affinity/enabled: runtime toggle switch
+ * Exposes (official AxDragonite protocol):
+ *  - /proc/ax_named_thread_affinity/pid (0666): get/set stored target pid
+ *  - /proc/ax_named_thread_affinity/named_thread_affinity (0222):
+ *      write "<comm> <mask>" (applies to stored pid)
+ *      or "<pid> <comm> <mask>" (explicit pid, also updates stored pid)
+ *  - /proc/ax_named_thread_affinity/reset (0222):
+ *      reset affinity of stored pid (or write "<pid>" to reset explicit pid)
  *  - Opportunistic affinity application on wake_up_new_task
  */
 
@@ -22,6 +26,7 @@
 #include <linux/string.h>
 #include <linux/ctype.h>
 #include <linux/ratelimit.h>
+#include <linux/version.h>
 
 #include "ax_dragonite.h"
 
@@ -37,6 +42,14 @@ EXPORT_SYMBOL_GPL(ax_named_affinity_dir);
 
 bool ax_named_affinity_enabled = true;
 EXPORT_SYMBOL_GPL(ax_named_affinity_enabled);
+
+/* Counters exported to stats node in ax_dragonite_core.c */
+extern unsigned long ax_total_affinity_applies;
+extern unsigned long ax_total_affinity_resets;
+
+/* Stored target pid for two-step write protocol */
+static pid_t stored_target_pid;
+static DEFINE_SPINLOCK(stored_pid_lock);
 
 static struct named_affinity_rule affinity_rules[AX_MAX_AFFINITY_RULES];
 static DEFINE_MUTEX(affinity_mutex);
@@ -123,80 +136,12 @@ void ax_named_thread_affinity_apply(struct task_struct *p)
 EXPORT_SYMBOL_GPL(ax_named_thread_affinity_apply);
 
 /* -------------------------------------------------------------------------
- * /proc/ax_named_thread_affinity/rules
+ * Helper: apply mask to all threads matching comm, update stored rule
  * ------------------------------------------------------------------------- */
-static ssize_t rules_write(struct file *file, const char __user *ubuf,
-			   size_t count, loff_t *ppos)
+static int nta_store_rule(const char *target_comm, const cpumask_t *mask)
 {
-	char kbuf[128];
-	char *comm_str, *mask_str, *ptr;
-	char target_comm[TASK_COMM_LEN];
-	cpumask_t mask;
 	int i, free_slot = -1, target_slot = -1;
-	size_t len = min(count, sizeof(kbuf) - 1);
 	unsigned long applied;
-	bool is_delete = false;
-
-	if (!ax_dragonite_is_authorized()) {
-		pr_warn_ratelimited(AX_DRAGONITE_TAG
-				    "unauthorized affinity rule write from uid %u\n",
-				    from_kuid(&init_user_ns, current_euid()));
-		return -EPERM;
-	}
-
-	if (copy_from_user(kbuf, ubuf, len))
-		return -EFAULT;
-	kbuf[len] = '\0';
-	ptr = strim(kbuf);
-
-	/* Expect "<comm> <hex_mask_or_cpulist>" or "!<comm>" */
-	comm_str = strsep(&ptr, " \t");
-	mask_str = ptr ? strim(ptr) : NULL;
-
-	if (!comm_str || strlen(comm_str) == 0) {
-		pr_warn_ratelimited(AX_DRAGONITE_TAG "malformed rule input: %s\n", kbuf);
-		return -EINVAL;
-	}
-
-	if (comm_str[0] == '!') {
-		is_delete = true;
-		strlcpy(target_comm, comm_str + 1, TASK_COMM_LEN);
-	} else {
-		strlcpy(target_comm, comm_str, TASK_COMM_LEN);
-		if (mask_str && (!strcmp(mask_str, "0") ||
-				 !strcasecmp(mask_str, "none") ||
-				 !strcasecmp(mask_str, "reset") ||
-				 !strcasecmp(mask_str, "del")))
-			is_delete = true;
-	}
-
-	if (is_delete) {
-		mutex_lock(&affinity_mutex);
-		for (i = 0; i < AX_MAX_AFFINITY_RULES; i++) {
-			if (affinity_rules[i].active &&
-			    strncmp(affinity_rules[i].comm, target_comm,
-				    TASK_COMM_LEN) == 0) {
-				/* Pairs with smp_load_acquire in apply hook */
-				smp_store_release(&affinity_rules[i].active,
-						  false);
-				affinity_rules[i].comm[0] = '\0';
-				cpumask_clear(&affinity_rules[i].mask);
-				target_slot = i;
-				break;
-			}
-		}
-		mutex_unlock(&affinity_mutex);
-		if (target_slot == -1)
-			return -ENOENT;
-		return count;
-	}
-
-	if (!mask_str || ax_parse_cpumask(mask_str, &mask) < 0 ||
-	    cpumask_empty(&mask)) {
-		pr_warn_ratelimited(AX_DRAGONITE_TAG "invalid cpumask in rule: %s\n",
-				    mask_str ? mask_str : "NULL");
-		return -EINVAL;
-	}
 
 	mutex_lock(&affinity_mutex);
 	for (i = 0; i < AX_MAX_AFFINITY_RULES; i++) {
@@ -213,22 +158,21 @@ static ssize_t rules_write(struct file *file, const char __user *ubuf,
 	if (target_slot == -1)
 		target_slot = free_slot;
 
-	if (target_slot != -1) {
-		strlcpy(affinity_rules[target_slot].comm, target_comm,
-			TASK_COMM_LEN);
-		cpumask_copy(&affinity_rules[target_slot].mask, &mask);
-		smp_store_release(&affinity_rules[target_slot].active, true);
-	}
-	mutex_unlock(&affinity_mutex);
-
 	if (target_slot == -1) {
+		mutex_unlock(&affinity_mutex);
 		pr_warn_ratelimited(AX_DRAGONITE_TAG "affinity rules table full\n");
 		return -ENOSPC;
 	}
 
-	/* Apply immediately to running threads matching this comm */
-	applied = apply_named_affinity_to_tasks(target_comm, &mask);
+	strlcpy(affinity_rules[target_slot].comm, target_comm, TASK_COMM_LEN);
+	cpumask_copy(&affinity_rules[target_slot].mask, mask);
+	smp_store_release(&affinity_rules[target_slot].active, true);
+	mutex_unlock(&affinity_mutex);
+
+	applied = apply_named_affinity_to_tasks(target_comm, mask);
 	if (applied) {
+		WRITE_ONCE(ax_total_affinity_applies,
+			   READ_ONCE(ax_total_affinity_applies) + applied);
 		mutex_lock(&affinity_mutex);
 		if (affinity_rules[target_slot].active &&
 		    strncmp(affinity_rules[target_slot].comm, target_comm,
@@ -236,43 +180,19 @@ static ssize_t rules_write(struct file *file, const char __user *ubuf,
 			affinity_rules[target_slot].applied_count += applied;
 		mutex_unlock(&affinity_mutex);
 	}
-
-	return count;
-}
-
-static int rules_show(struct seq_file *m, void *v)
-{
-	int i;
-	char mask_str[64];
-
-	mutex_lock(&affinity_mutex);
-	seq_printf(m, "# comm mask applied_count\n");
-	for (i = 0; i < AX_MAX_AFFINITY_RULES; i++) {
-		if (affinity_rules[i].active) {
-			cpumap_print_to_pagebuf(false, mask_str, &affinity_rules[i].mask);
-			seq_printf(m, "%-16s %s %lu\n",
-				   affinity_rules[i].comm,
-				   strim(mask_str),
-				   affinity_rules[i].applied_count);
-		}
-	}
-	mutex_unlock(&affinity_mutex);
 	return 0;
 }
 
-static int rules_open(struct inode *inode, struct file *file)
-{
-	return single_open(file, rules_show, NULL);
-}
-
 /* -------------------------------------------------------------------------
- * /proc/ax_named_thread_affinity/enabled
+ * /proc/ax_named_thread_affinity/pid  (0666)
+ * Read: stored target pid. Write: set stored target pid.
  * ------------------------------------------------------------------------- */
-static ssize_t enabled_write(struct file *file, const char __user *ubuf,
+static ssize_t nta_pid_write(struct file *file, const char __user *ubuf,
 			     size_t count, loff_t *ppos)
 {
-	char kbuf[8];
-	bool val;
+	char kbuf[16];
+	pid_t pid;
+	unsigned long flags;
 	size_t len = min(count, sizeof(kbuf) - 1);
 
 	if (!ax_dragonite_is_authorized())
@@ -282,70 +202,215 @@ static ssize_t enabled_write(struct file *file, const char __user *ubuf,
 		return -EFAULT;
 	kbuf[len] = '\0';
 
-	if (kstrtobool(strim(kbuf), &val) < 0)
+	if (kstrtoint(strim(kbuf), 10, &pid) < 0 || pid < 0)
 		return -EINVAL;
 
-	WRITE_ONCE(ax_named_affinity_enabled, val);
+	spin_lock_irqsave(&stored_pid_lock, flags);
+	stored_target_pid = pid;
+	spin_unlock_irqrestore(&stored_pid_lock, flags);
+
 	return count;
 }
 
-static int enabled_show(struct seq_file *m, void *v)
+static int nta_pid_show(struct seq_file *m, void *v)
 {
-	seq_printf(m, "%d\n", READ_ONCE(ax_named_affinity_enabled) ? 1 : 0);
+	unsigned long flags;
+	pid_t pid;
+
+	spin_lock_irqsave(&stored_pid_lock, flags);
+	pid = stored_target_pid;
+	spin_unlock_irqrestore(&stored_pid_lock, flags);
+
+	seq_printf(m, "%d\n", pid);
 	return 0;
 }
 
-static int enabled_open(struct inode *inode, struct file *file)
+static int nta_pid_open(struct inode *inode, struct file *file)
 {
-	return single_open(file, enabled_show, NULL);
+	return single_open(file, nta_pid_show, NULL);
+}
+
+/* -------------------------------------------------------------------------
+ * /proc/ax_named_thread_affinity/named_thread_affinity  (0222)
+ * Write "<comm> <mask>" — applies to stored pid's process group by comm name.
+ * Write "<pid> <comm> <mask>" — explicit pid, also updates stored pid.
+ * The rule is stored for future threads via wake_up_new_task hook.
+ * ------------------------------------------------------------------------- */
+static ssize_t nta_write(struct file *file, const char __user *ubuf,
+			 size_t count, loff_t *ppos)
+{
+	char kbuf[128];
+	char *ptr, *tok;
+	char target_comm[TASK_COMM_LEN];
+	cpumask_t mask;
+	pid_t explicit_pid = 0;
+	unsigned long flags;
+	size_t len = min(count, sizeof(kbuf) - 1);
+	int ret;
+
+	if (!ax_dragonite_is_authorized()) {
+		pr_warn_ratelimited(AX_DRAGONITE_TAG
+				    "unauthorized named_thread_affinity write from uid %u\n",
+				    from_kuid(&init_user_ns, current_euid()));
+		return -EPERM;
+	}
+
+	if (copy_from_user(kbuf, ubuf, len))
+		return -EFAULT;
+	kbuf[len] = '\0';
+	ptr = strim(kbuf);
+
+	/*
+	 * Disambiguate "<comm> <mask>" vs "<pid> <comm> <mask>":
+	 * If the first token is a pure decimal integer, treat as explicit pid.
+	 */
+	tok = strsep(&ptr, " \t");
+	if (!tok || !*tok)
+		return -EINVAL;
+
+	if (ptr) {
+		int maybe_pid;
+
+		if (kstrtoint(tok, 10, &maybe_pid) == 0 && maybe_pid > 0) {
+			/* Three-token form: <pid> <comm> <mask> */
+			explicit_pid = (pid_t)maybe_pid;
+			ptr = skip_spaces(ptr);
+			tok = strsep(&ptr, " \t");
+			if (!tok || !*tok)
+				return -EINVAL;
+		}
+	}
+
+	strlcpy(target_comm, tok, TASK_COMM_LEN);
+
+	if (!ptr || !*ptr) {
+		pr_warn_ratelimited(AX_DRAGONITE_TAG
+				    "named_thread_affinity: missing mask\n");
+		return -EINVAL;
+	}
+	ptr = skip_spaces(ptr);
+
+	if (ax_parse_cpumask(ptr, &mask) < 0 || cpumask_empty(&mask)) {
+		pr_warn_ratelimited(AX_DRAGONITE_TAG
+				    "named_thread_affinity: invalid mask: %s\n", ptr);
+		return -EINVAL;
+	}
+
+	if (explicit_pid) {
+		spin_lock_irqsave(&stored_pid_lock, flags);
+		stored_target_pid = explicit_pid;
+		spin_unlock_irqrestore(&stored_pid_lock, flags);
+	}
+
+	ret = nta_store_rule(target_comm, &mask);
+	return ret ? ret : (ssize_t)count;
+}
+
+/* -------------------------------------------------------------------------
+ * /proc/ax_named_thread_affinity/reset  (0222)
+ * Write "" or "0" — reset affinity of stored pid's threads matching stored rules.
+ * Write "<pid>" — reset affinity of that pid's threads.
+ * ------------------------------------------------------------------------- */
+static ssize_t nta_reset_write(struct file *file, const char __user *ubuf,
+			       size_t count, loff_t *ppos)
+{
+	char kbuf[16];
+	pid_t target_pid;
+	unsigned long flags;
+	struct task_struct *task;
+	size_t len = min(count, sizeof(kbuf) - 1);
+	int maybe_pid;
+
+	if (!ax_dragonite_is_authorized()) {
+		pr_warn_ratelimited(AX_DRAGONITE_TAG
+				    "unauthorized reset write from uid %u\n",
+				    from_kuid(&init_user_ns, current_euid()));
+		return -EPERM;
+	}
+
+	if (copy_from_user(kbuf, ubuf, len))
+		return -EFAULT;
+	kbuf[len] = '\0';
+
+	if (kstrtoint(strim(kbuf), 10, &maybe_pid) == 0 && maybe_pid > 0) {
+		target_pid = (pid_t)maybe_pid;
+		spin_lock_irqsave(&stored_pid_lock, flags);
+		stored_target_pid = target_pid;
+		spin_unlock_irqrestore(&stored_pid_lock, flags);
+	} else {
+		spin_lock_irqsave(&stored_pid_lock, flags);
+		target_pid = stored_target_pid;
+		spin_unlock_irqrestore(&stored_pid_lock, flags);
+	}
+
+	if (!target_pid)
+		return -EINVAL;
+
+	rcu_read_lock();
+	task = pid_task(find_pid_ns(target_pid, &init_pid_ns), PIDTYPE_PID);
+	if (task)
+		get_task_struct(task);
+	rcu_read_unlock();
+
+	if (!task)
+		return -ESRCH;
+
+	set_cpus_allowed_ptr(task, cpu_possible_mask);
+	put_task_struct(task);
+
+	WRITE_ONCE(ax_total_affinity_resets,
+		   READ_ONCE(ax_total_affinity_resets) + 1);
+
+	return count;
 }
 
 /* -------------------------------------------------------------------------
  * Procfs Ops definition
  * ------------------------------------------------------------------------- */
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 6, 0)
-static const struct proc_ops rules_ops = {
-	.proc_open = rules_open,
+static const struct proc_ops nta_pid_ops = {
+	.proc_open = nta_pid_open,
 	.proc_read = seq_read,
-	.proc_write = rules_write,
+	.proc_write = nta_pid_write,
 	.proc_lseek = seq_lseek,
 	.proc_release = single_release,
 };
 
-static const struct proc_ops enabled_ops = {
-	.proc_open = enabled_open,
-	.proc_read = seq_read,
-	.proc_write = enabled_write,
-	.proc_lseek = seq_lseek,
-	.proc_release = single_release,
+static const struct proc_ops nta_ops = {
+	.proc_write = nta_write,
+	.proc_lseek = noop_llseek,
+};
+
+static const struct proc_ops nta_reset_ops = {
+	.proc_write = nta_reset_write,
+	.proc_lseek = noop_llseek,
 };
 #else
-static const struct file_operations rules_ops = {
+static const struct file_operations nta_pid_ops = {
 	.owner = THIS_MODULE,
-	.open = rules_open,
+	.open = nta_pid_open,
 	.read = seq_read,
-	.write = rules_write,
+	.write = nta_pid_write,
 	.llseek = seq_lseek,
 	.release = single_release,
 };
 
-static const struct file_operations enabled_ops = {
+static const struct file_operations nta_ops = {
 	.owner = THIS_MODULE,
-	.open = enabled_open,
-	.read = seq_read,
-	.write = enabled_write,
-	.llseek = seq_lseek,
-	.release = single_release,
+	.write = nta_write,
+	.llseek = noop_llseek,
+};
+
+static const struct file_operations nta_reset_ops = {
+	.owner = THIS_MODULE,
+	.write = nta_reset_write,
+	.llseek = noop_llseek,
 };
 #endif
 
 /* -------------------------------------------------------------------------
  * Init / Exit
  * ------------------------------------------------------------------------- */
-/*
- * Named thread affinity is intentionally kept at /proc root to preserve compatibility
- * with Android userspace paths (/proc/ax_named_thread_affinity/{rules,enabled}).
- */
 int ax_named_thread_affinity_init(void)
 {
 	struct proc_dir_entry *entry;
@@ -356,28 +421,27 @@ int ax_named_thread_affinity_init(void)
 		return -ENOMEM;
 	}
 
-	entry = proc_create("rules", 0640, ax_named_affinity_dir, &rules_ops);
+	entry = proc_create("pid", 0666, ax_named_affinity_dir, &nta_pid_ops);
 	if (!entry)
-		goto err_rules;
+		goto err_pid;
 
-	entry = proc_create("enabled", 0640, ax_named_affinity_dir,
-			    &enabled_ops);
+	entry = proc_create("named_thread_affinity", 0222,
+			    ax_named_affinity_dir, &nta_ops);
 	if (!entry)
-		goto err_enabled;
+		goto err_nta;
 
-	/* Compatibility node at /proc/ax_named_thread_affinity_rules */
-	entry = proc_create("ax_named_thread_affinity_rules", 0640, NULL,
-			    &rules_ops);
+	entry = proc_create("reset", 0222, ax_named_affinity_dir,
+			    &nta_reset_ops);
 	if (!entry)
-		goto err_compat;
+		goto err_reset;
 
 	return 0;
 
-err_compat:
-	remove_proc_entry("enabled", ax_named_affinity_dir);
-err_enabled:
-	remove_proc_entry("rules", ax_named_affinity_dir);
-err_rules:
+err_reset:
+	remove_proc_entry("named_thread_affinity", ax_named_affinity_dir);
+err_nta:
+	remove_proc_entry("pid", ax_named_affinity_dir);
+err_pid:
 	remove_proc_entry("ax_named_thread_affinity", NULL);
 	ax_named_affinity_dir = NULL;
 	return -ENOMEM;
@@ -385,11 +449,10 @@ err_rules:
 
 void ax_named_thread_affinity_exit(void)
 {
-	remove_proc_entry("ax_named_thread_affinity_rules", NULL);
-
 	if (ax_named_affinity_dir) {
-		remove_proc_entry("enabled", ax_named_affinity_dir);
-		remove_proc_entry("rules", ax_named_affinity_dir);
+		remove_proc_entry("reset", ax_named_affinity_dir);
+		remove_proc_entry("named_thread_affinity", ax_named_affinity_dir);
+		remove_proc_entry("pid", ax_named_affinity_dir);
 		remove_proc_entry("ax_named_thread_affinity", NULL);
 	}
 }

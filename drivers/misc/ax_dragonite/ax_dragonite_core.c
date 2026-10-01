@@ -94,7 +94,14 @@ static int ax_kswapd_cpu_online(unsigned int cpu)
 
 static struct ax_boost_entry boost_table[AX_MAX_BOOST_ENTRIES];
 static unsigned long total_boost_count;
+static unsigned long total_kswapd_pin_count;
 static DEFINE_MUTEX(boost_table_mutex);
+
+/* Exported for ax_named_thread_affinity.c stats */
+unsigned long ax_total_affinity_applies;
+unsigned long ax_total_affinity_resets;
+EXPORT_SYMBOL_GPL(ax_total_affinity_applies);
+EXPORT_SYMBOL_GPL(ax_total_affinity_resets);
 
 /* CPUMask parser supporting hex ("0f", "0x0f") and cpulist ("0-3", "0,1,2") */
 int ax_parse_cpumask(const char *buf, cpumask_t *mask)
@@ -162,18 +169,23 @@ static ssize_t kswapd_pin_write(struct file *file, const char __user *ubuf,
 
 	spin_lock_irqsave(&kswapd_pin_lock, flags);
 	cpumask_copy(&kswapd_pinned_mask, &new_mask);
+	total_kswapd_pin_count++;
 	spin_unlock_irqrestore(&kswapd_pin_lock, flags);
 
 	/* 1. Pin NUMA node kswapd tasks directly via pgdat */
+	rcu_read_lock();
 	for_each_online_node(nid) {
 		struct pglist_data *pgdat = NODE_DATA(nid);
 
 		if (pgdat && pgdat->kswapd) {
 			get_task_struct(pgdat->kswapd);
+			rcu_read_unlock();
 			set_cpus_allowed_ptr(pgdat->kswapd, &new_mask);
 			put_task_struct(pgdat->kswapd);
+			rcu_read_lock();
 		}
 	}
+	rcu_read_unlock();
 
 #define AX_PIN_MAX_TASKS 16
 
@@ -556,6 +568,45 @@ static int swappiness_override_open(struct inode *inode, struct file *file)
 }
 
 /* -------------------------------------------------------------------------
+ * /proc/ax_dragonite/stats
+ * ------------------------------------------------------------------------- */
+static int stats_show(struct seq_file *m, void *v)
+{
+	unsigned long flags;
+	unsigned long kswapd_pins;
+	int active_boosts = 0, i;
+	unsigned long total_boosts;
+
+	spin_lock_irqsave(&kswapd_pin_lock, flags);
+	kswapd_pins = total_kswapd_pin_count;
+	spin_unlock_irqrestore(&kswapd_pin_lock, flags);
+
+	mutex_lock(&boost_table_mutex);
+	total_boosts = total_boost_count;
+	for (i = 0; i < AX_MAX_BOOST_ENTRIES; i++) {
+		if (boost_table[i].active)
+			active_boosts++;
+	}
+	mutex_unlock(&boost_table_mutex);
+
+	seq_printf(m,
+		   "kswapd_pins: %lu\n"
+		   "boost_total: %lu\n"
+		   "boost_active: %d\n"
+		   "affinity_applies: %lu\n"
+		   "affinity_resets: %lu\n",
+		   kswapd_pins, total_boosts, active_boosts,
+		   READ_ONCE(ax_total_affinity_applies),
+		   READ_ONCE(ax_total_affinity_resets));
+	return 0;
+}
+
+static int stats_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, stats_show, NULL);
+}
+
+/* -------------------------------------------------------------------------
  * /proc/ax_dragonite/version
  * ------------------------------------------------------------------------- */
 static int version_show(struct seq_file *m, void *v)
@@ -714,6 +765,13 @@ static const struct proc_ops swappiness_override_ops = {
 	.proc_release = single_release,
 };
 
+static const struct proc_ops stats_ops = {
+	.proc_open = stats_open,
+	.proc_read = seq_read,
+	.proc_lseek = seq_lseek,
+	.proc_release = single_release,
+};
+
 static const struct proc_ops version_ops = {
 	.proc_open = version_open,
 	.proc_read = seq_read,
@@ -748,6 +806,14 @@ static const struct file_operations swappiness_override_ops = {
 	.release = single_release,
 };
 
+static const struct file_operations stats_ops = {
+	.owner = THIS_MODULE,
+	.open = stats_open,
+	.read = seq_read,
+	.llseek = seq_lseek,
+	.release = single_release,
+};
+
 static const struct file_operations version_ops = {
 	.owner = THIS_MODULE,
 	.open = version_open,
@@ -773,12 +839,12 @@ static int __init ax_dragonite_core_init(void)
 		return -ENOMEM;
 	}
 
-	entry = proc_create("kswapd_pin", 0660, ax_dragonite_dir,
+	entry = proc_create("kswapd_pin", 0222, ax_dragonite_dir,
 			    &kswapd_pin_ops);
 	if (!entry)
 		goto err_kswapd_pin;
 
-	entry = proc_create("boost", 0660, ax_dragonite_dir, &boost_ops);
+	entry = proc_create("boost", 0222, ax_dragonite_dir, &boost_ops);
 	if (!entry)
 		goto err_boost;
 
@@ -786,6 +852,10 @@ static int __init ax_dragonite_core_init(void)
 			    &swappiness_override_ops);
 	if (!entry)
 		goto err_swappiness;
+
+	entry = proc_create("stats", 0444, ax_dragonite_dir, &stats_ops);
+	if (!entry)
+		goto err_stats;
 
 	entry = proc_create("version", 0444, ax_dragonite_dir, &version_ops);
 	if (!entry)
@@ -813,6 +883,8 @@ static int __init ax_dragonite_core_init(void)
 err_affinity:
 	remove_proc_entry("version", ax_dragonite_dir);
 err_version:
+	remove_proc_entry("stats", ax_dragonite_dir);
+err_stats:
 	remove_proc_entry("swappiness_override", ax_dragonite_dir);
 err_swappiness:
 	remove_proc_entry("boost", ax_dragonite_dir);
@@ -862,6 +934,7 @@ static void __exit ax_dragonite_core_exit(void)
 
 	if (ax_dragonite_dir) {
 		remove_proc_entry("version", ax_dragonite_dir);
+		remove_proc_entry("stats", ax_dragonite_dir);
 		remove_proc_entry("swappiness_override", ax_dragonite_dir);
 		remove_proc_entry("boost", ax_dragonite_dir);
 		remove_proc_entry("kswapd_pin", ax_dragonite_dir);
