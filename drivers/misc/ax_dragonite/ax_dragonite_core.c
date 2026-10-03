@@ -215,10 +215,11 @@ static ssize_t kswapd_pin_write(struct file *file, const char __user *ubuf,
 					pr_warn_ratelimited(AX_DRAGONITE_TAG
 						"kswapd_pin: task limit reached (%d), some tasks truncated\n",
 						AX_PIN_MAX_TASKS);
-					break;
+					goto kswapd_done;
 				}
 			}
 		}
+kswapd_done:
 		rcu_read_unlock();
 
 		for (i = 0; i < n; i++) {

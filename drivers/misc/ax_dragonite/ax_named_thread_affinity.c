@@ -76,12 +76,15 @@ static unsigned long apply_named_affinity_to_tasks(const char *comm,
 			get_task_comm(comm_buf, t);
 			if (strncmp(comm_buf, comm, TASK_COMM_LEN) == 0 &&
 			    !cpumask_equal(&t->cpus_allowed, mask)) {
-				get_task_struct(t);
-				batch[count++] = t;
-				if (count == AX_AFFINITY_BATCH_SIZE)
-					break;
+				if (count < AX_AFFINITY_BATCH_SIZE) {
+					get_task_struct(t);
+					batch[count++] = t;
+				}
+				if (count >= AX_AFFINITY_BATCH_SIZE)
+					goto batch_full;
 			}
 		}
+batch_full:
 		rcu_read_unlock();
 
 		for (i = 0; i < count; i++) {
@@ -240,7 +243,7 @@ static ssize_t nta_write(struct file *file, const char __user *ubuf,
 			 size_t count, loff_t *ppos)
 {
 	char kbuf[128];
-	char *ptr, *tok;
+	char *ptr, *mask_str, *comm_str;
 	char target_comm[TASK_COMM_LEN];
 	cpumask_t mask;
 	pid_t explicit_pid = 0;
@@ -260,39 +263,43 @@ static ssize_t nta_write(struct file *file, const char __user *ubuf,
 	kbuf[len] = '\0';
 	ptr = strim(kbuf);
 
-	/*
-	 * Disambiguate "<comm> <mask>" vs "<pid> <comm> <mask>":
-	 * If the first token is a pure decimal integer, treat as explicit pid.
-	 */
-	tok = strsep(&ptr, " \t");
-	if (!tok || !*tok)
-		return -EINVAL;
-
-	if (ptr) {
-		int maybe_pid;
-
-		if (kstrtoint(tok, 10, &maybe_pid) == 0 && maybe_pid > 0) {
-			/* Three-token form: <pid> <comm> <mask> */
-			explicit_pid = (pid_t)maybe_pid;
-			ptr = skip_spaces(ptr);
-			tok = strsep(&ptr, " \t");
-			if (!tok || !*tok)
-				return -EINVAL;
-		}
-	}
-
-	strlcpy(target_comm, tok, TASK_COMM_LEN);
-
-	if (!ptr || !*ptr) {
+	mask_str = strrchr(ptr, ' ');
+	if (!mask_str)
+		mask_str = strrchr(ptr, '\t');
+	if (!mask_str) {
 		pr_warn_ratelimited(AX_DRAGONITE_TAG
 				    "named_thread_affinity: missing mask\n");
 		return -EINVAL;
 	}
-	ptr = skip_spaces(ptr);
 
-	if (ax_parse_cpumask(ptr, &mask) < 0 || cpumask_empty(&mask)) {
+	*mask_str++ = '\0';
+	mask_str = skip_spaces(mask_str);
+	comm_str = strim(ptr);
+
+	if (!*comm_str || !*mask_str)
+		return -EINVAL;
+
+	{
+		char *first_space = strchr(comm_str, ' ');
+		if (!first_space)
+			first_space = strchr(comm_str, '\t');
+		if (first_space) {
+			int maybe_pid;
+			*first_space = '\0';
+			if (kstrtoint(comm_str, 10, &maybe_pid) == 0 && maybe_pid > 0) {
+				explicit_pid = (pid_t)maybe_pid;
+				comm_str = skip_spaces(first_space + 1);
+			} else {
+				*first_space = ' ';
+			}
+		}
+	}
+
+	strlcpy(target_comm, comm_str, TASK_COMM_LEN);
+
+	if (ax_parse_cpumask(mask_str, &mask) < 0 || cpumask_empty(&mask)) {
 		pr_warn_ratelimited(AX_DRAGONITE_TAG
-				    "named_thread_affinity: invalid mask: %s\n", ptr);
+				    "named_thread_affinity: invalid mask: %s\n", mask_str);
 		return -EINVAL;
 	}
 
